@@ -17,6 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
+
 # ---------------------------------------------------------------------------
 # Minimal YAML parser — handles the subset used by routing-law.yaml
 # ---------------------------------------------------------------------------
@@ -193,7 +194,8 @@ def _parse_item_mapping(
                 item[first_key], end = _parse_mapping(lines, nxt[0], nxt[1])
             # After parsing the nested block, continue from `end` for sibling keys
             return _continue_item_keys(lines, end, dash_indent + 2, item)
-        item[first_key] = ""
+        else:
+            item[first_key] = ""
 
     # Parse continuation keys at dash_indent + 2
     return _continue_item_keys(lines, start + 1, dash_indent + 2, item)
