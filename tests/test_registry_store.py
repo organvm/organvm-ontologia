@@ -298,7 +298,7 @@ def test_load_ignores_corrupt_persistence_records(store_dir: Path):
                 "timestamp": "2026-01-01T00:00:00+00:00",
                 "source": "system",
             },
-        )
+        ),
     )
 
     store = RegistryStore(store_dir=store_dir)

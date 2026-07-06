@@ -1,4 +1,3 @@
-import pytest
 from pathlib import Path
 
 from ontologia.entity.identity import EntityType
@@ -17,7 +16,7 @@ def test_search_entities_sorting(tmp_path: Path) -> None:
     store = open_store(tmp_path)
 
     e1 = store.create_entity(EntityType.ORGAN, "Apple Corporation")
-    e2 = store.create_entity(EntityType.ORGAN, "Banana Inc")
+    store.create_entity(EntityType.ORGAN, "Banana Inc")
     e3 = store.create_entity(EntityType.ORGAN, "Pineapple Ltd")
     e4 = store.create_entity(EntityType.ORGAN, "Apple")
 
@@ -55,6 +54,6 @@ def test_search_entities_historical_match(tmp_path: Path) -> None:
 def test_search_entities_no_match(tmp_path: Path) -> None:
     store = open_store(tmp_path)
     store.create_entity(EntityType.ORGAN, "Apple")
-    
+
     results = search_entities("orange", store)
     assert len(results) == 0
