@@ -40,6 +40,11 @@ class EntityType(str, Enum):
     VARIABLE = "variable"  # ONT-008: Entity > Continuant > SpecificallyDependentContinuant
     METRIC = "metric"      # ONT-009: Entity > Continuant > SpecificallyDependentContinuant
 
+    # Corpus elements
+    CONCEPT = "concept"
+    SPEC = "spec"
+    TRANSCRIPT = "transcript"
+
 
 class LifecycleStatus(str, Enum):
     """Entity lifecycle states."""
@@ -60,6 +65,9 @@ _TYPE_PREFIXES: dict[EntityType, str] = {
     EntityType.SESSION: "sess",
     EntityType.VARIABLE: "var",
     EntityType.METRIC: "met",
+    EntityType.CONCEPT: "cpt",
+    EntityType.SPEC: "spc",
+    EntityType.TRANSCRIPT: "trx",
 }
 
 
