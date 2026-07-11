@@ -18,6 +18,10 @@ _SIGNAL_TYPE_MAP: dict[str, ChangeType] = {
     "promotion_changed": ChangeType.STATE,
     "content_drift": ChangeType.SEMANTIC,
     "metric_spike": ChangeType.ANOMALY,
+    # BIFRONS portal sensors (star intake + upstream drift)
+    "github_star": ChangeType.RELATION,
+    "github_unstar": ChangeType.RELATION,
+    "external_repo_changed": ChangeType.STATE,
 }
 
 

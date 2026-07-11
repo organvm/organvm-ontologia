@@ -11,8 +11,10 @@ from ontologia.sensing.normalization import normalize_batch
 def _default_sensors(workspace: Path) -> list:
     """Create all available sensors for the given workspace."""
     from ontologia.sensing.ci_sensor import CISensor
+    from ontologia.sensing.external_repo_sensor import ExternalRepoSensor
     from ontologia.sensing.filesystem_sensor import FilesystemSensor
     from ontologia.sensing.git_sensor import GitSensor
+    from ontologia.sensing.github_star_sensor import GitHubStarSensor
     from ontologia.sensing.registry_sensor import RegistrySensor
     from ontologia.sensing.session_sensor import SessionSensor
 
@@ -22,6 +24,9 @@ def _default_sensors(workspace: Path) -> list:
         CISensor(workspace),
         SessionSensor(),
         FilesystemSensor(workspace),
+        # BIFRONS portal sensors — no-ops (is_available False) until stars sync.
+        GitHubStarSensor(),
+        ExternalRepoSensor(),
     ]
 
 
