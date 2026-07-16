@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _now_iso() -> str:
@@ -67,18 +67,27 @@ class ObservationStore:
     def path(self) -> Path:
         return self._path
 
-    def load(self) -> None:
-        """Load existing observations from JSONL."""
+    def load(
+        self,
+        on_error: Callable[[int, str, Exception], None] | None = None,
+    ) -> None:
+        """Load existing observations from JSONL.
+
+        ``on_error`` lets the owning registry preserve a hashed quarantine
+        diagnostic while keeping the historical skip-and-continue behavior.
+        """
         self._observations.clear()
         if not self._path.is_file():
             return
-        for line in self._path.read_text().splitlines():
-            line = line.strip()
+        for line_number, raw_line in enumerate(self._path.read_text().splitlines(), start=1):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 self._observations.append(Observation.from_dict(json.loads(line)))
-            except (json.JSONDecodeError, KeyError, ValueError):
+            except (json.JSONDecodeError, KeyError, ValueError) as error:
+                if on_error is not None:
+                    on_error(line_number, raw_line, error)
                 continue
 
     def record(self, obs: Observation) -> None:
