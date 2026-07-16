@@ -189,14 +189,25 @@ def test_self_image_is_deterministic_and_traceable(store: RegistryStore) -> None
     ).to_dict()
 
     assert json.dumps(image1, sort_keys=True) == json.dumps(image2, sort_keys=True)
-    assert image1["schema_id"] == "node-self-image.v1"
-    assert image1["owner"] == "owner:ontologia"
-    assert image1["memory_cursor"]["node_count"] == 2
-    assert image1["event_cursor"]["event_count"] >= 1
+    assert image1["contract_name"] == "node-self-image.v1"
+    assert image1["contract_version"] == 1
+    assert image1["node_id"] == repo.uid
+    assert image1["node_type"] == "repository"
+    assert image1["owner_reference"] == "owner:ontologia"
+    assert image1["cursors"]["memory"] == "memory:artifact:implementation"
+    assert image1["cursors"]["event"].startswith("event:sha256:")
+    assert set(image1["digests"]) == {"constitutional", "topology"}
     assert image1["relations"]["incoming"]
     assert image1["relations"]["outgoing"]
-    assert image1["active_ideal_forms"][0]["ideal_form_id"] == "ideal:perpetual-memory"
-    assert image1["evidence_refs"]
+    assert image1["active_ideal_forms"][0]["form_id"] == "ideal:perpetual-memory"
+    assert image1["evidence_references"]
+    assert "schema_id" not in image1
+    assert "identity" not in image1
+    assert all(
+        set(relation) == {"relation_type", "target_node_id", "evidence_references"}
+        for direction in image1["relations"].values()
+        for relation in direction
+    )
 
     trace = store.trace_state_value(repo.uid, "lifecycle_status")
     assert trace["value"] == "deprecated"

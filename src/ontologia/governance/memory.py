@@ -81,6 +81,7 @@ class ReviewedEdgeType(str, Enum):
     MERGES = "merges"
     CONTRADICTS = "contradicts"
     IMPLEMENTS = "implements"
+    ADOPTS = "adopts"
 
 
 class ReviewState(str, Enum):
@@ -396,40 +397,38 @@ class QuarantineDiagnostic:
 
 @dataclass(frozen=True)
 class NodeSelfImage:
-    """Deterministic, evidence-linked self-image for a registered entity."""
+    """Public ``node-self-image.v1`` projection for a registered entity."""
 
-    entity_id: str
-    owner: str
-    identity: dict[str, Any]
+    node_id: str
+    node_type: str
+    owner_reference: str
     relations: dict[str, list[dict[str, Any]]]
-    memory_cursor: dict[str, Any]
-    event_cursor: dict[str, Any]
+    cursors: dict[str, str | None]
+    digests: dict[str, str]
     observations: list[dict[str, Any]]
-    state: dict[str, Any]
-    constitutional_digest: str
-    topology_digest: str
     active_ideal_forms: list[dict[str, Any]]
-    last_reconciled_at: str
-    evidence_refs: list[dict[str, Any]]
+    reconciled_at: str
+    evidence_references: list[str]
+    display_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        body = {
-            "schema_id": "node-self-image.v1",
-            "entity_id": self.entity_id,
-            "owner": self.owner,
-            "identity": self.identity,
+        body: dict[str, Any] = {
+            "contract_name": "node-self-image.v1",
+            "contract_version": 1,
+            "node_id": self.node_id,
+            "node_type": self.node_type,
+            "owner_reference": self.owner_reference,
             "relations": self.relations,
-            "memory_cursor": self.memory_cursor,
-            "event_cursor": self.event_cursor,
+            "cursors": self.cursors,
+            "digests": self.digests,
             "observations": self.observations,
-            "state": self.state,
-            "constitutional_digest": self.constitutional_digest,
-            "topology_digest": self.topology_digest,
             "active_ideal_forms": self.active_ideal_forms,
-            "last_reconciled_at": self.last_reconciled_at,
-            "evidence_refs": self.evidence_refs,
+            "reconciled_at": self.reconciled_at,
+            "evidence_references": self.evidence_references,
         }
-        return {**body, "self_image_digest": content_digest(body)}
+        if self.display_name is not None:
+            body["display_name"] = self.display_name
+        return body
 
 
 def evidence_refs(nodes: Iterable[AuthorityNode]) -> list[dict[str, Any]]:

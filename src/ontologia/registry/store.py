@@ -731,50 +731,89 @@ class RegistryStore:
         if not constitutional_digest or not last_reconciled_at:
             raise ValueError("self-image requires constitutional digest and reconciliation time")
 
+        def relation_evidence(payload: dict[str, Any]) -> list[str]:
+            metadata = payload.get("metadata", {})
+            configured = metadata.get("evidence_references", [])
+            if isinstance(configured, list) and configured:
+                return sorted({str(reference) for reference in configured})
+            return [f"registry-edge:{content_digest(payload)}"]
+
         parent = self._edge_index.parent(entity_id, at=last_reconciled_at)
         incoming: list[dict[str, Any]] = []
         outgoing: list[dict[str, Any]] = []
         if parent is not None:
-            incoming.append({"kind": "hierarchy", **parent.to_dict()})
-        outgoing.extend(
-            {"kind": "hierarchy", **edge.to_dict()}
-            for edge in self._edge_index.children(entity_id, at=last_reconciled_at)
-        )
-        incoming.extend(
-            {"kind": "relation", **edge.to_dict()}
-            for edge in self._edge_index.incoming_relations(entity_id, at=last_reconciled_at)
-        )
-        outgoing.extend(
-            {"kind": "relation", **edge.to_dict()}
-            for edge in self._edge_index.outgoing_relations(entity_id, at=last_reconciled_at)
-        )
+            payload = parent.to_dict()
+            incoming.append(
+                {
+                    "relation_type": "member_of",
+                    "target_node_id": parent.parent_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.children(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            outgoing.append(
+                {
+                    "relation_type": "contains",
+                    "target_node_id": edge.child_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.incoming_relations(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            incoming.append(
+                {
+                    "relation_type": edge.relation_type,
+                    "target_node_id": edge.source_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.outgoing_relations(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            outgoing.append(
+                {
+                    "relation_type": edge.relation_type,
+                    "target_node_id": edge.target_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
 
         linked_nodes = self._authority_graph.nodes_for_entity(entity_id)
         linked_node_ids = {node.node_id for node in linked_nodes}
         for edge in self._authority_graph.edges():
+            references = sorted(
+                {span.source_id for span in edge.evidence}
+                or {f"governance-edge:{edge.edge_id}"},
+            )
             if edge.target_node_id in linked_node_ids:
-                incoming.append({"kind": "governance", **edge.to_dict()})
+                incoming.append(
+                    {
+                        "relation_type": edge.edge_type.value,
+                        "target_node_id": edge.source_node_id,
+                        "evidence_references": references,
+                    },
+                )
             if edge.source_node_id in linked_node_ids:
-                outgoing.append({"kind": "governance", **edge.to_dict()})
+                outgoing.append(
+                    {
+                        "relation_type": edge.edge_type.value,
+                        "target_node_id": edge.target_node_id,
+                        "evidence_references": references,
+                    },
+                )
 
         incoming.sort(key=canonical_json)
         outgoing.sort(key=canonical_json)
         relations = {"incoming": incoming, "outgoing": outgoing}
 
         latest_node = linked_nodes[-1] if linked_nodes else None
-        memory_cursor = {
-            "node_count": len(linked_nodes),
-            "latest_node_id": latest_node.node_id if latest_node else None,
-            "latest_observed_at": latest_node.observed_at if latest_node else None,
-        }
+        memory_cursor = f"memory:{latest_node.node_id}" if latest_node else None
 
         entity_events = self.events(subject_entity=entity_id, limit=100_000)
         latest_event = entity_events[-1] if entity_events else None
-        event_cursor = {
-            "event_count": len(entity_events),
-            "latest_event_type": latest_event.event_type if latest_event else None,
-            "latest_timestamp": latest_event.timestamp if latest_event else None,
-        }
+        event_cursor = (
+            f"event:{content_digest(latest_event.to_dict())}" if latest_event else None
+        )
 
         latest_observations: dict[str, Observation] = {}
         for observation in self.observation_store.query(entity_id=entity_id):
@@ -784,50 +823,97 @@ class RegistryStore:
                 current.source,
             ):
                 latest_observations[observation.metric_id] = observation
-        observations = [
-            latest_observations[metric_id].to_dict()
-            for metric_id in sorted(latest_observations)
-        ]
+        observations: list[dict[str, Any]] = []
+        for metric_id in sorted(latest_observations):
+            observation = latest_observations[metric_id]
+            payload = observation.to_dict()
+            configured = observation.metadata.get("evidence_references", [])
+            references = (
+                sorted({str(reference) for reference in configured})
+                if isinstance(configured, list) and configured
+                else [f"observation:{content_digest(payload)}"]
+            )
+            observations.append(
+                {
+                    "key": observation.metric_id,
+                    "value": observation.value,
+                    "observed_at": observation.timestamp or last_reconciled_at,
+                    "evidence_references": references,
+                },
+            )
 
         ideals: list[dict[str, Any]] = []
         for node in linked_nodes:
             ideal_form_id = node.metadata.get("ideal_form_id")
             if ideal_form_id is None or node.metadata.get("active", True) is False:
                 continue
+            predicate = node.metadata.get("predicate")
+            if not isinstance(predicate, str) or not predicate:
+                raise ValueError(f"active ideal form {ideal_form_id} lacks a predicate")
+            distance = float(node.metadata.get("distance_to_ideal", 1.0))
+            if not 0 <= distance <= 1:
+                raise ValueError(f"active ideal form {ideal_form_id} has invalid distance")
+            implementation_state = str(
+                node.metadata.get("implementation_state", "not_started"),
+            )
+            valid_states = {
+                "not_started",
+                "partial",
+                "implemented",
+                "verified",
+                "blocked",
+                "superseded",
+            }
+            if implementation_state not in valid_states:
+                raise ValueError(
+                    f"active ideal form {ideal_form_id} has invalid implementation state",
+                )
             ideals.append(
                 {
-                    "ideal_form_id": ideal_form_id,
-                    "source_node_id": node.node_id,
-                    "implementation_state": node.metadata.get("implementation_state", "unknown"),
-                    "distance_to_ideal": node.metadata.get("distance_to_ideal"),
-                    "predicate": node.metadata.get("predicate"),
-                    "receipt": node.metadata.get("receipt"),
+                    "form_id": str(ideal_form_id),
+                    "implementation_state": implementation_state,
+                    "distance_to_ideal": distance,
+                    "predicate_references": [predicate],
+                    "evidence_references": sorted(
+                        {span.source_id for span in node.evidence}
+                        | ({str(node.metadata["receipt"])} if node.metadata.get("receipt") else set()),
+                    ),
                 },
             )
         ideals.sort(key=canonical_json)
 
         current_name = self.current_name(entity_id, at=last_reconciled_at)
-        state = {
-            "lifecycle_status": entity.lifecycle_status.value,
-            "display_name": current_name.display_name if current_name else None,
-            "metadata": entity.metadata,
-        }
         owner = str(entity.metadata.get("owner", entity.created_by))
+        entity_type_map = {
+            EntityType.ORGAN: "organ",
+            EntityType.REPO: "repository",
+            EntityType.MODULE: "module",
+            EntityType.DOCUMENT: "document",
+            EntityType.SESSION: "session",
+            EntityType.VARIABLE: "artifact",
+            EntityType.METRIC: "artifact",
+        }
+        source_references = sorted(
+            {span.source_id for node in linked_nodes for span in node.evidence},
+        )
+        if not source_references:
+            source_references = [f"entity:{content_digest(entity.to_dict())}"]
 
         return NodeSelfImage(
-            entity_id=entity_id,
-            owner=owner,
-            identity=entity.to_dict(),
+            node_id=entity_id,
+            node_type=entity_type_map[entity.entity_type],
+            display_name=current_name.display_name if current_name else None,
+            owner_reference=owner,
             relations=relations,
-            memory_cursor=memory_cursor,
-            event_cursor=event_cursor,
+            cursors={"memory": memory_cursor, "event": event_cursor},
+            digests={
+                "constitutional": constitutional_digest,
+                "topology": content_digest(relations),
+            },
             observations=observations,
-            state=state,
-            constitutional_digest=constitutional_digest,
-            topology_digest=content_digest(relations),
             active_ideal_forms=ideals,
-            last_reconciled_at=last_reconciled_at,
-            evidence_refs=evidence_refs(linked_nodes),
+            reconciled_at=last_reconciled_at,
+            evidence_references=source_references,
         )
 
     def trace_state_value(self, entity_id: str, field_name: str) -> dict[str, Any]:
