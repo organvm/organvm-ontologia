@@ -61,6 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--out", required=True)
     reconcile.add_argument("--max-input-bytes", type=int, default=16_777_216)
     reconcile.add_argument("--max-artifact-bytes", type=int, default=16_777_216)
+    reconcile.add_argument(
+        "--allow-blocked",
+        action="store_true",
+        help=(
+            "Materialize exact-all owner-routed debt without claiming ready; "
+            "valid only for direct pre-cadence inputs"
+        ),
+    )
 
     import_command = governance_commands.add_parser(
         "import",
@@ -90,6 +98,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = open_store(Path(args.state_root))
     if args.governance_command == "reconcile":
         if args.snapshot_bundle:
+            if args.allow_blocked:
+                parser.error(
+                    "--allow-blocked is valid only for the direct pre-cadence interface",
+                )
             result = reconcile_snapshot_bundle(
                 store,
                 load_materialized_snapshot_bundle(
@@ -152,11 +164,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.coverage,
                     args.max_input_bytes,
                 ),
+                allow_blocked=args.allow_blocked,
             )
             result = reconcile_governance_snapshot(
                 store,
                 inputs,
                 output_dir=Path(args.out),
+                allow_blocked=args.allow_blocked,
             )
         _print_json(result["receipt"])
         return 0

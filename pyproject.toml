@@ -15,6 +15,8 @@ dev = ["pytest>=8.0", "ruff>=0.4", "pyright>=1.1"]
 
 [project.scripts]
 ontologia = "ontologia.cli:main"
+ontologia-governance-cadence-reconcile = "ontologia.governance.cadence_owner:main"
+ontologia-governance-cadence-predicate = "ontologia.governance.cadence_predicate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

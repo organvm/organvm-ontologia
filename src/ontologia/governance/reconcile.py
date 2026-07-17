@@ -510,6 +510,7 @@ class ReconcileInputs:
     assertion_evidence: tuple[Mapping[str, Any], ...]
     normalization_parity_receipt: Mapping[str, Any]
     coverage_receipt: Mapping[str, Any]
+    readiness: Mapping[str, Any]
     input_digest: str
 
 
@@ -576,6 +577,137 @@ def _digest_excluding(value: Mapping[str, Any], digest_field: str) -> str:
     return content_digest(body)
 
 
+def _normalize_readiness(
+    value: Any,
+    *,
+    label: str,
+    status_field: str = "status",
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} readiness is invalid")
+    exact_all = value.get("exact_all")
+    ready = value.get("ready")
+    status = value.get(status_field)
+    if not isinstance(exact_all, bool) or not isinstance(ready, bool):
+        raise ValueError(f"{label} readiness is invalid")
+    readiness: dict[str, Any] = {"exact_all": exact_all}
+    for field_name in _READINESS_DEBT_FIELDS:
+        debt = value.get(field_name)
+        if (
+            not isinstance(debt, list)
+            or len(debt) != len(set(map(str, debt)))
+            or not all(isinstance(item, str) and item for item in debt)
+        ):
+            raise ValueError(f"{label} readiness {field_name} is invalid")
+        readiness[field_name] = sorted(debt)
+    computed_ready = exact_all and not any(
+        readiness[field_name] for field_name in _READINESS_DEBT_FIELDS
+    )
+    if ready is not computed_ready:
+        raise ValueError(f"{label} readiness contradicts its declared debt")
+    if status not in {
+        "incomplete",
+        "blocked",
+        "ready",
+        "closed_with_owner_routed_debt",
+    }:
+        raise ValueError(f"{label} readiness status is invalid")
+    if (ready and status != "ready") or (not ready and status == "ready"):
+        raise ValueError(f"{label} readiness status contradicts ready")
+    readiness.update(
+        {
+            "ready": ready,
+            "status": str(status),
+        },
+    )
+    return readiness
+
+
+def _combined_readiness(
+    parity: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+    assertions: tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    parity_readiness = _normalize_readiness(
+        parity.get("readiness"),
+        label="normalization parity receipt",
+    )
+    coverage_readiness = _normalize_readiness(
+        {
+            "exact_all": coverage.get("exact_all"),
+            "ready": coverage.get("ready"),
+            "status": coverage.get("closure_status"),
+            **{
+                field_name: coverage.get(field_name)
+                for field_name in _READINESS_DEBT_FIELDS
+            },
+        },
+        label="coverage receipt",
+    )
+    result: dict[str, Any] = {
+        "exact_all": bool(
+            parity_readiness["exact_all"] and coverage_readiness["exact_all"],
+        ),
+    }
+    for field_name in _READINESS_DEBT_FIELDS:
+        result[field_name] = sorted(
+            {
+                *parity_readiness[field_name],
+                *coverage_readiness[field_name],
+            },
+        )
+    for assertion in assertions:
+        assertion_id = _required_text(assertion, "assertion_id")
+        if assertion.get("verification_state") != "verified":
+            assertion_reference = (
+                assertion_id
+                if assertion_id.startswith("assertion:")
+                else f"assertion:{assertion_id}"
+            )
+            result["citation_debt"] = sorted(
+                {*result["citation_debt"], assertion_reference},
+            )
+            result["incomplete_predicates"] = sorted(
+                {
+                    *result["incomplete_predicates"],
+                    f"predicate:verify-assertion:{assertion_id}",
+                },
+            )
+    result["ready"] = bool(
+        result["exact_all"]
+        and not any(result[field_name] for field_name in _READINESS_DEBT_FIELDS),
+    )
+    result["status"] = (
+        "ready"
+        if result["ready"]
+        else "closed_with_owner_routed_debt"
+        if result["exact_all"]
+        else "incomplete"
+    )
+    return result
+
+
+def _source_reference_aliases(
+    envelope: Mapping[str, Any],
+    *,
+    parity_receipt_id: str,
+) -> set[str]:
+    source_id = _required_text(envelope, "source_id")
+    aliases = {
+        *_bound_reference_aliases("source", source_id),
+        f"source-envelope:{source_id}",
+        f"source-envelope.v1.jsonl#{source_id}",
+        (
+            f"receipt:{parity_receipt_id}:"
+            f"source-envelope.v1.jsonl#{source_id}"
+        ),
+    }
+    projection_pointer = envelope.get("redacted_projection_pointer")
+    if isinstance(projection_pointer, str) and projection_pointer:
+        aliases.add(projection_pointer)
+    return aliases
+
+
 def build_reconcile_inputs(
     *,
     snapshot_id: str,
@@ -590,6 +722,7 @@ def build_reconcile_inputs(
     normalization_parity_receipt: Any,
     coverage_receipt: Any,
     generated_at: str | None = None,
+    allow_blocked: bool = False,
 ) -> ReconcileInputs:
     """Validate and bind the acyclic pre-cadence reconciliation interface."""
     if not _DIGEST_PATTERN.fullmatch(snapshot_digest):
@@ -622,56 +755,77 @@ def build_reconcile_inputs(
         raise ValueError("normalization parity snapshot binding mismatch")
     if parity.get("receipt_digest") != _digest_excluding(parity, "receipt_digest"):
         raise ValueError("normalization parity digest mismatch")
-    parity_readiness = parity.get("readiness")
-    if (
-        not isinstance(parity_readiness, Mapping)
-        or parity_readiness.get("exact_all") is not True
-        or parity_readiness.get("ready") is not True
-        or parity_readiness.get("status") != "ready"
-        or any(
-            not isinstance(parity_readiness.get(field_name), list)
-            or parity_readiness.get(field_name)
-            for field_name in _READINESS_DEBT_FIELDS
-        )
+    parity_readiness = _normalize_readiness(
+        parity.get("readiness"),
+        label="normalization parity receipt",
+    )
+    if parity_readiness["exact_all"] is not True or (
+        not allow_blocked and parity_readiness["ready"] is not True
     ):
         raise ValueError("normalization parity receipt is not ready")
     if coverage.get("snapshot_id") != snapshot_id:
         raise ValueError("coverage receipt snapshot binding mismatch")
     if coverage.get("receipt_hash") != _digest_excluding(coverage, "receipt_hash"):
         raise ValueError("coverage receipt digest mismatch")
-    if (
-        coverage.get("exact_all") is not True
-        or coverage.get("ready") is not True
-        or coverage.get("closure_status") != "ready"
-        or any(
-            not isinstance(coverage.get(field_name), list)
-            or coverage.get(field_name)
-            for field_name in (*_READINESS_DEBT_FIELDS, "residual_owners")
+    residual_owners = coverage.get("residual_owners")
+    if not isinstance(residual_owners, list) or not all(
+        isinstance(owner, Mapping)
+        and all(
+            isinstance(owner.get(field_name), str) and owner.get(field_name)
+            for field_name in (
+                "owner_reference",
+                "failed_predicate",
+                "next_action",
+            )
         )
+        for owner in residual_owners
+    ):
+        raise ValueError("coverage receipt residual owners are invalid")
+    coverage_readiness = _normalize_readiness(
+        {
+            "exact_all": coverage.get("exact_all"),
+            "ready": coverage.get("ready"),
+            "status": coverage.get("closure_status"),
+            **{
+                field_name: coverage.get(field_name)
+                for field_name in _READINESS_DEBT_FIELDS
+            },
+        },
+        label="coverage receipt",
+    )
+    if coverage_readiness["exact_all"] is not True or (
+        not allow_blocked and coverage_readiness["ready"] is not True
     ):
         raise ValueError("coverage receipt is not ready")
 
     census_raw_units = _required_list(census, "raw_units")
-    census_hashes = {
-        str(item.get("raw_unit_id")): item.get("content_hash")
-        for item in census_raw_units
-        if isinstance(item, Mapping)
-    }
-    if (
-        not census_hashes
-        or len(census_hashes) != len(census_raw_units)
-        or any(
+    census_hashes: dict[str, str | None] = {}
+    for item in census_raw_units:
+        if not isinstance(item, Mapping):
+            raise ValueError("source census raw units are invalid or duplicated")
+        raw_unit_id = _required_text(item, "raw_unit_id")
+        if raw_unit_id in census_hashes:
+            raise ValueError("source census raw units are invalid or duplicated")
+        content_hash = item.get("content_hash")
+        acquisition_status = _required_text(item, "acquisition_status")
+        if content_hash is not None and (
             not isinstance(content_hash, str)
             or not _DIGEST_PATTERN.fullmatch(content_hash)
-            for content_hash in census_hashes.values()
-        )
-    ):
+        ):
+            raise ValueError("source census raw units are invalid or duplicated")
+        if acquisition_status == "acquired" and content_hash is None:
+            raise ValueError("acquired source census raw unit lacks content hash")
+        if not allow_blocked and content_hash is None:
+            raise ValueError("source census raw units are invalid or duplicated")
+        census_hashes[raw_unit_id] = content_hash
+    if not census_hashes:
         raise ValueError("source census raw units are invalid or duplicated")
 
     if not isinstance(source_envelopes, list) or not source_envelopes:
         raise ValueError("source envelopes must be a non-empty list")
     envelopes: list[Mapping[str, Any]] = []
     envelope_ids: set[str] = set()
+    envelope_raw_unit_ids: set[str] = set()
     for raw_envelope in source_envelopes:
         envelope = _require_contract(raw_envelope, "source-envelope.v1")
         source_id = _required_text(envelope, "source_id")
@@ -684,21 +838,54 @@ def build_reconcile_inputs(
             or custody.get("immutable") is not True
         ):
             raise ValueError(f"source envelope {source_id} custody binding mismatch")
-        content_hash = envelope.get("raw_unit_content_hash") or envelope.get("body_hash")
-        if census_hashes.get(raw_unit_id) != content_hash:
+        raw_unit_content_hash = envelope.get("raw_unit_content_hash")
+        if (
+            not isinstance(raw_unit_content_hash, str)
+            or not _DIGEST_PATTERN.fullmatch(raw_unit_content_hash)
+            or census_hashes.get(raw_unit_id) != raw_unit_content_hash
+        ):
             raise ValueError(f"source envelope {source_id} raw content binding mismatch")
         body_hash = _required_text(envelope, "body_hash")
-        if not _DIGEST_PATTERN.fullmatch(body_hash) or body_hash != content_hash:
+        if not _DIGEST_PATTERN.fullmatch(body_hash):
             raise ValueError(f"source envelope {source_id} body hash mismatch")
         if source_id in envelope_ids:
             raise ValueError("source envelope IDs must be unique")
         envelope_ids.add(source_id)
+        envelope_raw_unit_ids.add(raw_unit_id)
         envelopes.append(envelope)
+    acquired_raw_unit_ids = {
+        raw_unit_id
+        for raw_unit_id, content_hash in census_hashes.items()
+        if content_hash is not None
+    }
+    if envelope_raw_unit_ids != acquired_raw_unit_ids:
+        raise ValueError("source envelopes do not cover every acquired raw unit")
+    parity_receipt_id = _required_text(parity, "receipt_id")
+    envelope_body_hashes = {
+        _required_text(envelope, "source_id"): _required_text(envelope, "body_hash")
+        for envelope in envelopes
+    }
     envelope_references = {
         reference
-        for source_id in envelope_ids
-        for reference in _bound_reference_aliases("source", source_id)
+        for envelope in envelopes
+        for reference in _source_reference_aliases(
+            envelope,
+            parity_receipt_id=parity_receipt_id,
+        )
     }
+    for node in graph["nodes"]:
+        source_id = _required_text(node, "source_envelope_id")
+        if envelope_body_hashes.get(source_id) != node.get("content_hash"):
+            raise ValueError(
+                f"lineage node {node.get('node_id')} source envelope is unresolved",
+            )
+    for edge in graph["edges"]:
+        for span in edge["evidence_spans"]:
+            source_id = _required_text(span, "source_envelope_id")
+            if envelope_body_hashes.get(source_id) != span.get("body_hash"):
+                raise ValueError(
+                    f"lineage edge {edge.get('edge_id')} source envelope is unresolved",
+                )
 
     if not isinstance(normalized_events, list) or not normalized_events:
         raise ValueError("normalized events must be a non-empty list")
@@ -745,21 +932,93 @@ def build_reconcile_inputs(
         or set(map(str, parity_output.get("event_ids", []))) != event_ids
     ):
         raise ValueError("normalization parity event crosswalk mismatch")
-    coverage_sources = _required_list(coverage, "sources")
-    covered_source_ids = {
-        str(item.get("source_id"))
-        for item in coverage_sources
-        if isinstance(item, Mapping)
-    }
-    if covered_source_ids != envelope_ids:
-        raise ValueError("coverage receipt source denominator mismatch")
-    if any(
-        not isinstance(item, Mapping)
-        or item.get("status") != "parsed"
-        or item.get("accessible") is not True
-        for item in coverage_sources
+    promotions = parity.get("promotions")
+    if not isinstance(promotions, list):
+        raise ValueError("normalization parity promotion crosswalk mismatch")
+    promotion_by_raw_unit: dict[str, Mapping[str, Any]] = {}
+    promoted_event_ids: set[str] = set()
+    for promotion in promotions:
+        if not isinstance(promotion, Mapping):
+            raise ValueError("normalization parity promotion crosswalk mismatch")
+        raw_unit_id = _required_text(promotion, "raw_unit_id")
+        if raw_unit_id in promotion_by_raw_unit:
+            raise ValueError("normalization parity promotion crosswalk mismatch")
+        if promotion.get("raw_unit_content_hash") != census_hashes.get(raw_unit_id):
+            raise ValueError("normalization parity promotion content hash mismatch")
+        promotion_events = promotion.get("event_ids")
+        disposition = promotion.get("disposition")
+        if isinstance(promotion_events, list) and promotion_events:
+            if disposition is not None or not all(
+                isinstance(event_id, str) and event_id in event_ids
+                for event_id in promotion_events
+            ):
+                raise ValueError("normalization parity promotion crosswalk mismatch")
+            if promoted_event_ids & set(promotion_events):
+                raise ValueError("normalization parity event is promoted more than once")
+            promoted_event_ids.update(promotion_events)
+        elif (
+            not allow_blocked
+            or not isinstance(disposition, Mapping)
+            or disposition.get("type") not in {"blocked", "quarantined"}
+        ):
+            raise ValueError("normalization parity promotion crosswalk mismatch")
+        promotion_by_raw_unit[raw_unit_id] = promotion
+    if (
+        set(promotion_by_raw_unit) != set(census_hashes)
+        or promoted_event_ids != event_ids
     ):
-        raise ValueError("coverage receipt contains a non-ready source")
+        raise ValueError("normalization parity promotion crosswalk mismatch")
+    coverage_sources = _required_list(coverage, "sources")
+    denominator = coverage.get("denominator")
+    if (
+        not isinstance(denominator, Mapping)
+        or denominator.get("count") != len(census_hashes)
+        or not isinstance(denominator.get("manifest_hash"), str)
+        or not _DIGEST_PATTERN.fullmatch(str(denominator.get("manifest_hash")))
+    ):
+        raise ValueError("coverage receipt source denominator mismatch")
+    coverage_by_raw_unit: dict[str, Mapping[str, Any]] = {}
+    for item in coverage_sources:
+        if not isinstance(item, Mapping):
+            raise ValueError("coverage receipt source denominator mismatch")
+        source_id = _required_text(item, "source_id")
+        raw_unit_id = "raw_" + source_id.removeprefix("src_")
+        if raw_unit_id in coverage_by_raw_unit:
+            raise ValueError("coverage receipt source denominator mismatch")
+        coverage_by_raw_unit[raw_unit_id] = item
+    if set(coverage_by_raw_unit) != set(census_hashes):
+        # Compatibility with earlier ready fixtures where coverage classified
+        # one source envelope per one raw unit.
+        coverage_source_ids = {
+            str(item.get("source_id"))
+            for item in coverage_sources
+            if isinstance(item, Mapping)
+        }
+        if len(census_hashes) != len(envelope_ids) or coverage_source_ids != envelope_ids:
+            raise ValueError("coverage receipt source denominator mismatch")
+        coverage_by_raw_unit = {
+            raw_unit_id: item
+            for raw_unit_id, item in zip(
+                sorted(census_hashes),
+                sorted(
+                    coverage_sources,
+                    key=lambda source: str(source.get("source_id")),
+                ),
+                strict=True,
+            )
+        }
+    for raw_unit_id, item in coverage_by_raw_unit.items():
+        status = item.get("status")
+        accessible = item.get("accessible")
+        content_hash = census_hashes[raw_unit_id]
+        if content_hash is not None and (
+            status != "parsed" or accessible is not True
+        ):
+            raise ValueError("coverage receipt misclassifies an acquired source")
+        if content_hash is None and (
+            not allow_blocked or status == "parsed" or accessible is not False
+        ):
+            raise ValueError("coverage receipt contains a non-ready source")
 
     if not isinstance(assertion_evidence, list) or not assertion_evidence:
         raise ValueError("assertion evidence must be a non-empty list")
@@ -767,6 +1026,9 @@ def build_reconcile_inputs(
         _require_contract(record, "assertion-evidence.v1")
         for record in assertion_evidence
     )
+    readiness = _combined_readiness(parity, coverage, assertions)
+    if not allow_blocked and readiness["ready"] is not True:
+        raise ValueError("reconciliation assertion evidence is not ready")
     generated_candidates = [
         _required_timestamp(graph, "generated_at"),
         _required_timestamp(parity, "generated_at"),
@@ -811,17 +1073,28 @@ def build_reconcile_inputs(
         assertion_evidence=assertions,
         normalization_parity_receipt=parity,
         coverage_receipt=coverage,
+        readiness=readiness,
         input_digest=exact_input_digest,
     )
 
 
-def build_snapshot_evidence_index(inputs: ReconcileInputs) -> SnapshotEvidenceIndex:
-    """Derive the only references allowed in a ready self-image set."""
+def build_snapshot_evidence_index(
+    inputs: ReconcileInputs,
+    *,
+    allow_blocked: bool = False,
+) -> SnapshotEvidenceIndex:
+    """Derive the only references allowed in a traceable self-image set."""
     source_references: set[str] = set()
     evidence_digests: dict[str, str] = {}
+    parity_receipt_id = _required_text(
+        inputs.normalization_parity_receipt,
+        "receipt_id",
+    )
     for envelope in inputs.source_envelopes:
-        source_id = _required_text(envelope, "source_id")
-        aliases = _bound_reference_aliases("source", source_id)
+        aliases = _source_reference_aliases(
+            envelope,
+            parity_receipt_id=parity_receipt_id,
+        )
         source_references.update(aliases)
         body_hash = _required_text(envelope, "body_hash")
         evidence_digests.update({alias: body_hash for alias in aliases})
@@ -868,16 +1141,20 @@ def build_snapshot_evidence_index(inputs: ReconcileInputs) -> SnapshotEvidenceIn
     assertion_references: set[str] = set()
     for assertion in inputs.assertion_evidence:
         assertion_id = _required_text(assertion, "assertion_id")
-        if assertion.get("verification_state") != "verified":
+        verification_state = assertion.get("verification_state")
+        if verification_state not in {"verified", "unverified"}:
+            raise ValueError(f"assertion {assertion_id} verification state is invalid")
+        if not allow_blocked and verification_state != "verified":
             raise ValueError(f"assertion {assertion_id} is not verified")
         freshness = assertion.get("freshness")
-        if not isinstance(freshness, Mapping) or freshness.get("status") != "fresh":
-            raise ValueError(f"assertion {assertion_id} is stale")
-        _, verified_time = _required_timestamp(freshness, "verified_at")
-        if verified_time < snapshot_time or verified_time > generated_time:
-            raise ValueError(
-                f"assertion {assertion_id} verification is outside the snapshot window",
-            )
+        if verification_state == "verified":
+            if not isinstance(freshness, Mapping) or freshness.get("status") != "fresh":
+                raise ValueError(f"assertion {assertion_id} is stale")
+            _, verified_time = _required_timestamp(freshness, "verified_at")
+            if verified_time < snapshot_time or verified_time > generated_time:
+                raise ValueError(
+                    f"assertion {assertion_id} verification is outside the snapshot window",
+                )
         evidence = _required_list(assertion, "evidence_references")
         if not evidence:
             raise ValueError(f"assertion {assertion_id} has no evidence")
@@ -1117,6 +1394,7 @@ def validate_self_image_set(
     value: Any,
     *,
     evidence_index: SnapshotEvidenceIndex,
+    allow_blocked: bool = False,
 ) -> Mapping[str, Any]:
     """Validate denominator, snapshot window, and every public evidence edge."""
     image_set = _require_contract(value, SELF_IMAGE_SET_CONTRACT)
@@ -1256,19 +1534,29 @@ def validate_self_image_set(
     if counts.get("exported") != len(images):
         raise ValueError("counts.exported does not match self_images")
 
-    readiness = image_set.get("readiness")
-    if (
-        not isinstance(readiness, Mapping)
-        or readiness.get("exact_all") is not True
-        or readiness.get("ready") is not True
-        or readiness.get("status") != "ready"
-        or any(
-            not isinstance(readiness.get(field_name), list)
-            or readiness.get(field_name)
-            for field_name in _READINESS_DEBT_FIELDS
-        )
+    readiness = _normalize_readiness(
+        image_set.get("readiness"),
+        label="node self-image set",
+    )
+    if readiness["exact_all"] is not True or (
+        not allow_blocked and readiness["ready"] is not True
     ):
         raise ValueError("node self-image set is not ready")
+    if not readiness["ready"]:
+        if readiness["status"] not in {
+            "blocked",
+            "closed_with_owner_routed_debt",
+        }:
+            raise ValueError("node self-image set blocked status is invalid")
+        receipt_references = set(evidence_index.predicate_receipt_references)
+        for image in images:
+            if not isinstance(image, Mapping) or not (
+                set(map(str, image.get("evidence_references", [])))
+                & receipt_references
+            ):
+                raise ValueError(
+                    "blocked self-image lacks a real owner receipt reference",
+                )
 
     body = dict(image_set)
     actual_set_digest = body.pop("set_digest")
@@ -1283,6 +1571,8 @@ def build_self_image_set(
     evidence_index: SnapshotEvidenceIndex,
     reconciled_at: str,
     constitutional_digest: str,
+    readiness: Mapping[str, Any] | None = None,
+    allow_blocked: bool = False,
 ) -> dict[str, Any]:
     """Export exactly one deterministic self-image for every registered entity."""
     entities = sorted(store.list_entities(), key=lambda entity: entity.uid)
@@ -1306,6 +1596,33 @@ def build_self_image_set(
         ).to_dict()
         for node_id in registered_node_ids
     ]
+    normalized_readiness = _normalize_readiness(
+        readiness
+        or {
+            "exact_all": True,
+            **{field_name: [] for field_name in _READINESS_DEBT_FIELDS},
+            "ready": True,
+            "status": "ready",
+        },
+        label="node self-image set",
+    )
+    if not normalized_readiness["ready"]:
+        if not allow_blocked:
+            raise ValueError("node self-image set is not ready")
+        receipt_references = sorted(
+            reference
+            for reference in evidence_index.predicate_receipt_references
+            if reference.startswith("receipt:")
+        )
+        if not receipt_references:
+            raise ValueError("blocked self-image set lacks owner receipt evidence")
+        for image in images:
+            image["evidence_references"] = sorted(
+                {
+                    *map(str, image["evidence_references"]),
+                    *receipt_references,
+                },
+            )
     for image in images:
         if not image["observations"]:
             raise ValueError(f"registered node {image['node_id']} has no traceable observations")
@@ -1333,20 +1650,15 @@ def build_self_image_set(
             "registered": len(registered_node_ids),
             "exported": len(images),
         },
-        "readiness": {
-            "exact_all": True,
-            "unresolved_blockers": [],
-            "quarantines": [],
-            "missing_requirements": [],
-            "citation_debt": [],
-            "incomplete_predicates": [],
-            "ready": True,
-            "status": "ready",
-        },
+        "readiness": normalized_readiness,
         "digest_algorithm": "sha256-rfc8785-excluding-self-digest-v1",
     }
     result = {**body, "set_digest": content_digest(body)}
-    validate_self_image_set(result, evidence_index=evidence_index)
+    validate_self_image_set(
+        result,
+        evidence_index=evidence_index,
+        allow_blocked=allow_blocked,
+    )
     return result
 
 
@@ -1375,9 +1687,13 @@ def reconcile_governance_snapshot(
     inputs: ReconcileInputs,
     *,
     output_dir: Path,
+    allow_blocked: bool = False,
 ) -> dict[str, Any]:
     """Reconcile exact pre-cadence owner artifacts without a final-bundle cycle."""
-    evidence_index = build_snapshot_evidence_index(inputs)
+    evidence_index = build_snapshot_evidence_index(
+        inputs,
+        allow_blocked=allow_blocked,
+    )
     lineage_graph = validate_lineage_graph(
         inputs.lineage_graph,
         snapshot_id=inputs.snapshot_id,
@@ -1387,6 +1703,8 @@ def reconcile_governance_snapshot(
         lineage_graph,
         snapshot_id=inputs.snapshot_id,
     )
+    if result.unresolved:
+        raise ValueError("governance reconciliation has unresolved reviewed-lineage debt")
     constitutional_digest = content_digest(inputs.governance_testament)
 
     exported_lineage = export_lineage_graph(
@@ -1400,6 +1718,8 @@ def reconcile_governance_snapshot(
         evidence_index=evidence_index,
         reconciled_at=inputs.generated_at,
         constitutional_digest=constitutional_digest,
+        readiness=inputs.readiness,
+        allow_blocked=allow_blocked,
     )
     receipt = {
         "contract_name": RECONCILIATION_RECEIPT_CONTRACT,
@@ -1422,11 +1742,13 @@ def reconcile_governance_snapshot(
         },
         "exact_one": self_image_set["readiness"]["exact_all"],
         "unresolved": list(result.unresolved),
+        "readiness": deepcopy(self_image_set["readiness"]),
         "ready": result.ready and bool(self_image_set["readiness"]["ready"]),
     }
-    if not receipt["ready"]:
+    if not receipt["ready"] and not allow_blocked:
         raise ValueError("governance reconciliation has unresolved reviewed-lineage debt")
 
+    store.save()
     _write_if_changed(output_dir / "lineage-graph.json", exported_lineage)
     _write_if_changed(output_dir / "node-self-image-set.json", self_image_set)
     _write_if_changed(output_dir / "reconciliation-receipt.json", receipt)
