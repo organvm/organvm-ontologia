@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ from ontologia.governance.reconcile import (
     import_lineage_graph,
     load_materialized_snapshot_bundle,
     reconcile_snapshot_bundle,
+    validate_self_image_set,
 )
 from ontologia.registry.store import RegistryStore
 
@@ -389,9 +391,21 @@ def test_public_reconciliation_exports_exact_one_fixed_point(
     assert first["receipt"]["ready"] is True
     image_set = first["node_self_image_set"]
     assert image_set["contract_name"] == "node-self-image-set.v1"
+    assert image_set["registry_reference"] == "#/registry_projection"
+    assert image_set["registry_projection"] == [
+        {
+            "uid": imported_repo.uid,
+            "entity_type": "repo",
+            "lifecycle_status": "active",
+        },
+    ]
+    assert image_set["registry_digest"] == content_digest(
+        image_set["registry_projection"],
+    )
     assert image_set["registered_node_ids"] == [imported_repo.uid]
     assert [image["node_id"] for image in image_set["self_images"]] == [imported_repo.uid]
     assert image_set["readiness"]["exact_all"] is True
+    assert validate_self_image_set(image_set, snapshot_id=SNAPSHOT) == image_set
     assert {
         path.name: path.read_bytes()
         for path in sorted(output_dir.iterdir())
@@ -400,6 +414,72 @@ def test_public_reconciliation_exports_exact_one_fixed_point(
     assert (
         imported_store.store_dir / "governance-reconciliations.jsonl"
     ).read_bytes() == receipt_log_before
+
+
+def test_self_image_set_rejects_self_declared_or_tampered_denominators(
+    tmp_path: Path,
+) -> None:
+    store = RegistryStore(tmp_path / "registry")
+    store.load()
+    repo = store.create_entity(
+        EntityType.REPO,
+        "governed-repository",
+        created_by="registry",
+        metadata={
+            "owner": "owner:governed-repository",
+            "custody_path": "/private/must-not-export",
+        },
+        timestamp_ms=31,
+    )
+    store.record_observation(
+        "metric:governance-coverage",
+        repo.uid,
+        1.0,
+        source="test",
+    )
+    directive = _intent_node("intent:registry-denominator", entity_id=repo.uid)
+    directive.metadata.update(
+        {
+            "ideal_form_id": "ideal:registry-denominator",
+            "predicate_receipts": [
+                {
+                    "predicate_id": "predicate:registry-denominator",
+                    "receipt_reference": "receipt:registry-denominator",
+                    "result": "pass",
+                },
+            ],
+        },
+    )
+    store.add_authority_node(directive)
+    image_set = build_self_image_set(
+        store,
+        snapshot_id=SNAPSHOT,
+        snapshot_digest="sha256:" + "c" * 64,
+        reconciled_at=RECONCILED,
+        constitutional_digest="sha256:" + "b" * 64,
+    )
+
+    projection = image_set["registry_projection"]
+    assert projection == [
+        {
+            "uid": repo.uid,
+            "entity_type": "repo",
+            "lifecycle_status": "active",
+        },
+    ]
+    assert "private" not in json.dumps(projection)
+
+    tampered_projection = deepcopy(image_set)
+    tampered_projection["registry_projection"][0]["lifecycle_status"] = "archived"
+    with pytest.raises(ValueError, match="registry_digest"):
+        validate_self_image_set(tampered_projection)
+
+    self_declared = deepcopy(image_set)
+    replacement_id = repo.uid[:-1] + ("A" if repo.uid[-1] != "A" else "B")
+    self_declared["registered_node_ids"] = [replacement_id]
+    self_declared["self_images"][0]["node_id"] = replacement_id
+    with pytest.raises(ValueError, match="derive exactly"):
+        validate_self_image_set(self_declared)
 
 
 def test_self_image_set_rejects_empty_registry(store: RegistryStore) -> None:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
+from ontologia.entity.identity import EntityType, LifecycleStatus
 from ontologia.governance.memory import (
     AuthorityClass,
     AuthorityEdge,
@@ -47,6 +48,8 @@ _PUBLIC_METADATA_KEYS = {
 }
 _SOURCE_ID_PATTERN = re.compile(r"^src_[A-Za-z0-9_-]+$")
 _DIGEST_PATTERN = re.compile(r"^sha256:[a-f0-9]{64}$")
+_ENTITY_UID_PATTERN = re.compile(r"^ent_[a-z]+_[0-9A-HJKMNP-TV-Z]{26}$")
+_PUBLIC_REGISTRY_NODE_KEYS = {"uid", "entity_type", "lifecycle_status"}
 _LANES = {"operator_intent", "artifact"}
 _AUTHORITY_CLASSES = {
     "operator_intent",
@@ -639,6 +642,88 @@ def export_lineage_graph(
     return graph
 
 
+def validate_self_image_set(
+    value: Any,
+    *,
+    snapshot_id: str | None = None,
+) -> Mapping[str, Any]:
+    """Validate the public registry denominator and exact-one image binding."""
+    image_set = _require_contract(value, SELF_IMAGE_SET_CONTRACT)
+    for field_name in (
+        "set_id",
+        "snapshot_id",
+        "snapshot_digest",
+        "registry_reference",
+        "registry_digest",
+        "set_digest",
+    ):
+        _required_text(image_set, field_name)
+    if snapshot_id is not None and image_set["snapshot_id"] != snapshot_id:
+        raise ValueError("node self-image set snapshot_id does not match snapshot")
+    if image_set["registry_reference"] != "#/registry_projection":
+        raise ValueError(
+            "registry_reference must resolve to the embedded registry_projection",
+        )
+
+    registry_projection = _required_list(image_set, "registry_projection")
+    if not registry_projection:
+        raise ValueError("registry_projection must be non-empty")
+    projection_node_ids: list[str] = []
+    for node in registry_projection:
+        if not isinstance(node, Mapping):
+            raise ValueError("registry_projection node must be an object")
+        if set(node) != _PUBLIC_REGISTRY_NODE_KEYS:
+            raise ValueError(
+                "registry_projection nodes must contain only public identity fields",
+            )
+        uid = _required_text(node, "uid")
+        entity_type = _required_text(node, "entity_type")
+        lifecycle_status = _required_text(node, "lifecycle_status")
+        if not _ENTITY_UID_PATTERN.fullmatch(uid):
+            raise ValueError("registry_projection uid is not schema-valid")
+        if entity_type not in {item.value for item in EntityType}:
+            raise ValueError("registry_projection entity_type is not schema-valid")
+        if lifecycle_status not in {item.value for item in LifecycleStatus}:
+            raise ValueError("registry_projection lifecycle_status is not schema-valid")
+        projection_node_ids.append(uid)
+    if len(projection_node_ids) != len(set(projection_node_ids)):
+        raise ValueError("registry_projection uid values must be unique")
+    if projection_node_ids != sorted(projection_node_ids):
+        raise ValueError("registry_projection must be ordered by ascending uid")
+    if content_digest(registry_projection) != image_set["registry_digest"]:
+        raise ValueError("registry_digest does not bind the registry_projection")
+
+    registered_node_ids = _required_list(image_set, "registered_node_ids")
+    if registered_node_ids != projection_node_ids:
+        raise ValueError(
+            "registered_node_ids must derive exactly from registry_projection",
+        )
+    images = _required_list(image_set, "self_images")
+    image_node_ids = [
+        _required_text(image, "node_id") for image in images if isinstance(image, Mapping)
+    ]
+    if len(image_node_ids) != len(images):
+        raise ValueError("self_images must contain only objects")
+    if image_node_ids != registered_node_ids:
+        raise ValueError(
+            "self_images must derive exactly and in order from registered_node_ids",
+        )
+
+    counts = image_set.get("counts")
+    if not isinstance(counts, Mapping):
+        raise ValueError("self-image counts must be an object")
+    if counts.get("registered") != len(registry_projection):
+        raise ValueError("counts.registered does not match registry_projection")
+    if counts.get("exported") != len(images):
+        raise ValueError("counts.exported does not match self_images")
+
+    body = dict(image_set)
+    actual_set_digest = body.pop("set_digest")
+    if content_digest(body) != actual_set_digest:
+        raise ValueError("set_digest does not bind the self-image set")
+    return image_set
+
+
 def build_self_image_set(
     store: RegistryStore,
     *,
@@ -648,7 +733,16 @@ def build_self_image_set(
     constitutional_digest: str,
 ) -> dict[str, Any]:
     """Export exactly one deterministic self-image for every registered entity."""
-    registered_node_ids = sorted(entity.uid for entity in store.list_entities())
+    entities = sorted(store.list_entities(), key=lambda entity: entity.uid)
+    registry_projection = [
+        {
+            "uid": entity.uid,
+            "entity_type": entity.entity_type.value,
+            "lifecycle_status": entity.lifecycle_status.value,
+        }
+        for entity in entities
+    ]
+    registered_node_ids = [str(node["uid"]) for node in registry_projection]
     if not registered_node_ids:
         raise ValueError("node self-image set requires at least one registered node")
     images = [
@@ -671,17 +765,14 @@ def build_self_image_set(
     )
     if not exact_one:
         raise ValueError("self-image coverage is not exact-one")
-    registry_projection = [
-        entity.to_dict()
-        for entity in sorted(store.list_entities(), key=lambda entity: entity.uid)
-    ]
     body = {
         "contract_name": SELF_IMAGE_SET_CONTRACT,
         "contract_version": 1,
         "set_id": f"self-images:{snapshot_id}",
         "snapshot_id": snapshot_id,
         "snapshot_digest": snapshot_digest,
-        "registry_reference": "registry:ontologia",
+        "registry_reference": "#/registry_projection",
+        "registry_projection": registry_projection,
         "registry_digest": content_digest(registry_projection),
         "registered_node_ids": registered_node_ids,
         "self_images": images,
@@ -701,7 +792,9 @@ def build_self_image_set(
         },
         "digest_algorithm": "sha256-rfc8785-excluding-self-digest-v1",
     }
-    return {**body, "set_digest": content_digest(body)}
+    result = {**body, "set_digest": content_digest(body)}
+    validate_self_image_set(result, snapshot_id=snapshot_id)
+    return result
 
 
 def _append_receipt(path: Path, receipt: Mapping[str, Any]) -> None:
