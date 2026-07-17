@@ -12,6 +12,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
@@ -34,7 +35,42 @@ LINEAGE_CONTRACT = "lineage-graph.v1"
 SELF_IMAGE_SET_CONTRACT = "node-self-image-set.v1"
 RECONCILIATION_RECEIPT_CONTRACT = "governance-reconciliation-receipt.v1"
 SNAPSHOT_BUNDLE_CONTRACT = "governance-snapshot-bundle.v1"
-_SNAPSHOT_ARTIFACT_FIELDS = ("lineage_graph", "governance_testament")
+_SNAPSHOT_ARTIFACT_FIELDS = (
+    "source_census",
+    "lineage_graph",
+    "governance_testament",
+    "coverage",
+    "ideal_form_register",
+    "normalization_parity_receipt",
+)
+_FINAL_BUNDLE_REQUIRED_FIELDS = (
+    "bundle_id",
+    "generated_at",
+    "source_census",
+    "normalized_events",
+    "source_envelopes",
+    "assertion_evidence",
+    "lineage_graph",
+    "governance_testament",
+    "coverage",
+    "ideal_form_register",
+    "node_self_image_set",
+    "iceberg_atlas",
+    "normalization_parity_receipt",
+    "governance_stage_receipts",
+    "governance_cadence_receipts",
+    "post_proof_idempotence",
+    "governance_atlas_receipt",
+    "readiness",
+    "bundle_digest",
+)
+_READINESS_DEBT_FIELDS = (
+    "unresolved_blockers",
+    "quarantines",
+    "missing_requirements",
+    "citation_debt",
+    "incomplete_predicates",
+)
 _PUBLIC_METADATA_KEYS = {
     "active",
     "authority_event_references",
@@ -171,6 +207,18 @@ def _required_list(value: Mapping[str, Any], field_name: str) -> list[Any]:
     return field
 
 
+def _required_timestamp(value: Mapping[str, Any], field_name: str) -> tuple[str, datetime]:
+    text = _required_text(value, field_name)
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ValueError(f"invalid_{field_name}") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"invalid_{field_name}")
+    return text, parsed
+
+
 def _require_contract(value: Any, contract_name: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{contract_name} must be an object")
@@ -226,6 +274,12 @@ def load_materialized_snapshot_bundle(
     """Resolve local snapshot artifact references only after exact digest checks."""
     raw = _load_json(path, max_input_bytes)
     snapshot = _require_contract(raw, SNAPSHOT_BUNDLE_CONTRACT)
+    declared_bundle_digest = snapshot.get("bundle_digest")
+    if (
+        declared_bundle_digest is not None
+        and declared_bundle_digest != _digest_excluding(snapshot, "bundle_digest")
+    ):
+        raise ValueError("final governance snapshot bundle digest mismatch")
     snapshot_id = _required_text(snapshot, "snapshot_id")
     materialized = deepcopy(dict(snapshot))
     references: dict[str, dict[str, Any]] = {}
@@ -440,6 +494,423 @@ class ImportResult:
         return not self.unresolved
 
 
+@dataclass(frozen=True)
+class ReconcileInputs:
+    """Exact pre-cadence owner artifacts required by registry reconciliation."""
+
+    snapshot_id: str
+    snapshot_digest: str
+    snapshot_at: str
+    generated_at: str
+    lineage_graph: Mapping[str, Any]
+    governance_testament: Mapping[str, Any]
+    source_census: Mapping[str, Any]
+    source_envelopes: tuple[Mapping[str, Any], ...]
+    normalized_events: tuple[Mapping[str, Any], ...]
+    assertion_evidence: tuple[Mapping[str, Any], ...]
+    normalization_parity_receipt: Mapping[str, Any]
+    coverage_receipt: Mapping[str, Any]
+    input_digest: str
+
+
+@dataclass(frozen=True)
+class SnapshotEvidenceIndex:
+    """Snapshot-bound references that may appear in public self-images."""
+
+    snapshot_id: str
+    snapshot_digest: str
+    snapshot_at: str
+    generated_at: str
+    input_digest: str
+    source_references: tuple[str, ...]
+    event_references: tuple[str, ...]
+    assertion_references: tuple[str, ...]
+    predicate_receipt_references: tuple[str, ...]
+
+    @property
+    def allowed_references(self) -> frozenset[str]:
+        return frozenset(
+            (
+                *self.source_references,
+                *self.event_references,
+                *self.assertion_references,
+                *self.predicate_receipt_references,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot_id": self.snapshot_id,
+            "snapshot_digest": self.snapshot_digest,
+            "snapshot_at": self.snapshot_at,
+            "generated_at": self.generated_at,
+            "input_digest": self.input_digest,
+            "source_references": list(self.source_references),
+            "event_references": list(self.event_references),
+            "assertion_references": list(self.assertion_references),
+            "predicate_receipt_references": list(
+                self.predicate_receipt_references,
+            ),
+        }
+
+    @property
+    def digest(self) -> str:
+        return content_digest(self.to_dict())
+
+
+def _reference_resolves(reference: Any, identifiers: set[str] | frozenset[str]) -> bool:
+    return str(reference or "") in identifiers
+
+
+def _bound_reference_aliases(prefix: str, identifier: str) -> set[str]:
+    return {identifier, f"{prefix}:{identifier}"}
+
+
+def _resolve_bound_value(reference: Any, bindings: Mapping[str, str]) -> str | None:
+    return bindings.get(str(reference or ""))
+
+
+def _digest_excluding(value: Mapping[str, Any], digest_field: str) -> str:
+    body = dict(value)
+    body.pop(digest_field, None)
+    return content_digest(body)
+
+
+def build_reconcile_inputs(
+    *,
+    snapshot_id: str,
+    snapshot_digest: str,
+    snapshot_at: str,
+    lineage_graph: Any,
+    governance_testament: Any,
+    source_census: Any,
+    source_envelopes: Any,
+    normalized_events: Any,
+    assertion_evidence: Any,
+    normalization_parity_receipt: Any,
+    coverage_receipt: Any,
+    generated_at: str | None = None,
+) -> ReconcileInputs:
+    """Validate and bind the acyclic pre-cadence reconciliation interface."""
+    if not _DIGEST_PATTERN.fullmatch(snapshot_digest):
+        raise ValueError("snapshot_digest is not schema-valid")
+    snapshot_time_text, snapshot_time = _required_timestamp(
+        {"snapshot_at": snapshot_at},
+        "snapshot_at",
+    )
+    census = _require_contract(source_census, "source-census.v1")
+    parity = _require_contract(
+        normalization_parity_receipt,
+        "normalization-parity-receipt.v1",
+    )
+    coverage = _require_contract(coverage_receipt, "coverage-receipt.v1")
+    graph = validate_lineage_graph(lineage_graph, snapshot_id=snapshot_id)
+    testament = _require_contract(governance_testament, "governance-testament.v1")
+
+    if (
+        census.get("snapshot_id") != snapshot_id
+        or census.get("snapshot_digest") != snapshot_digest
+        or census.get("snapshot_at") != snapshot_at
+    ):
+        raise ValueError("source census snapshot binding mismatch")
+    if census.get("census_digest") != _digest_excluding(census, "census_digest"):
+        raise ValueError("source census digest mismatch")
+    if (
+        parity.get("snapshot_id") != snapshot_id
+        or parity.get("snapshot_digest") != snapshot_digest
+    ):
+        raise ValueError("normalization parity snapshot binding mismatch")
+    if parity.get("receipt_digest") != _digest_excluding(parity, "receipt_digest"):
+        raise ValueError("normalization parity digest mismatch")
+    parity_readiness = parity.get("readiness")
+    if (
+        not isinstance(parity_readiness, Mapping)
+        or parity_readiness.get("exact_all") is not True
+        or parity_readiness.get("ready") is not True
+        or parity_readiness.get("status") != "ready"
+        or any(
+            not isinstance(parity_readiness.get(field_name), list)
+            or parity_readiness.get(field_name)
+            for field_name in _READINESS_DEBT_FIELDS
+        )
+    ):
+        raise ValueError("normalization parity receipt is not ready")
+    if coverage.get("snapshot_id") != snapshot_id:
+        raise ValueError("coverage receipt snapshot binding mismatch")
+    if coverage.get("receipt_hash") != _digest_excluding(coverage, "receipt_hash"):
+        raise ValueError("coverage receipt digest mismatch")
+    if (
+        coverage.get("exact_all") is not True
+        or coverage.get("ready") is not True
+        or coverage.get("closure_status") != "ready"
+        or any(
+            not isinstance(coverage.get(field_name), list)
+            or coverage.get(field_name)
+            for field_name in (*_READINESS_DEBT_FIELDS, "residual_owners")
+        )
+    ):
+        raise ValueError("coverage receipt is not ready")
+
+    census_raw_units = _required_list(census, "raw_units")
+    census_hashes = {
+        str(item.get("raw_unit_id")): item.get("content_hash")
+        for item in census_raw_units
+        if isinstance(item, Mapping)
+    }
+    if (
+        not census_hashes
+        or len(census_hashes) != len(census_raw_units)
+        or any(
+            not isinstance(content_hash, str)
+            or not _DIGEST_PATTERN.fullmatch(content_hash)
+            for content_hash in census_hashes.values()
+        )
+    ):
+        raise ValueError("source census raw units are invalid or duplicated")
+
+    if not isinstance(source_envelopes, list) or not source_envelopes:
+        raise ValueError("source envelopes must be a non-empty list")
+    envelopes: list[Mapping[str, Any]] = []
+    envelope_ids: set[str] = set()
+    for raw_envelope in source_envelopes:
+        envelope = _require_contract(raw_envelope, "source-envelope.v1")
+        source_id = _required_text(envelope, "source_id")
+        raw_unit_id = _required_text(envelope, "raw_unit_id")
+        custody = envelope.get("custody_snapshot")
+        if (
+            not isinstance(custody, Mapping)
+            or custody.get("snapshot_id") != snapshot_id
+            or custody.get("snapshot_hash") != snapshot_digest
+            or custody.get("immutable") is not True
+        ):
+            raise ValueError(f"source envelope {source_id} custody binding mismatch")
+        content_hash = envelope.get("raw_unit_content_hash") or envelope.get("body_hash")
+        if census_hashes.get(raw_unit_id) != content_hash:
+            raise ValueError(f"source envelope {source_id} raw content binding mismatch")
+        body_hash = _required_text(envelope, "body_hash")
+        if not _DIGEST_PATTERN.fullmatch(body_hash) or body_hash != content_hash:
+            raise ValueError(f"source envelope {source_id} body hash mismatch")
+        if source_id in envelope_ids:
+            raise ValueError("source envelope IDs must be unique")
+        envelope_ids.add(source_id)
+        envelopes.append(envelope)
+    envelope_references = {
+        reference
+        for source_id in envelope_ids
+        for reference in _bound_reference_aliases("source", source_id)
+    }
+
+    if not isinstance(normalized_events, list) or not normalized_events:
+        raise ValueError("normalized events must be a non-empty list")
+    events: list[Mapping[str, Any]] = []
+    event_ids: set[str] = set()
+    for raw_event in normalized_events:
+        event = _require_contract(raw_event, "normalized-event.v1")
+        if (
+            event.get("snapshot_id") != snapshot_id
+            or event.get("snapshot_digest") != snapshot_digest
+        ):
+            raise ValueError("normalized event snapshot binding mismatch")
+        event_id = _required_text(event, "event_id")
+        raw_unit_id = _required_text(event, "raw_unit_id")
+        content_hash = event.get("raw_unit_content_hash")
+        if content_hash is None and isinstance(event.get("identity_basis"), Mapping):
+            content_hash = event["identity_basis"].get("content_hash")
+        if (
+            not isinstance(content_hash, str)
+            or not _DIGEST_PATTERN.fullmatch(content_hash)
+            or census_hashes.get(raw_unit_id) != content_hash
+        ):
+            raise ValueError(f"normalized event {event_id} raw content binding mismatch")
+        if not _reference_resolves(
+            event.get("source_envelope_reference"),
+            envelope_references,
+        ):
+            raise ValueError(f"normalized event {event_id} source envelope is unresolved")
+        if event_id in event_ids:
+            raise ValueError("normalized event IDs must be unique")
+        event_ids.add(event_id)
+        events.append(event)
+
+    parity_input = parity.get("input_census")
+    parity_output = parity.get("output_events")
+    if (
+        not isinstance(parity_input, Mapping)
+        or parity_input.get("census_digest") != census.get("census_digest")
+        or set(map(str, parity_input.get("raw_unit_ids", []))) != set(census_hashes)
+    ):
+        raise ValueError("normalization parity census crosswalk mismatch")
+    if (
+        not isinstance(parity_output, Mapping)
+        or set(map(str, parity_output.get("event_ids", []))) != event_ids
+    ):
+        raise ValueError("normalization parity event crosswalk mismatch")
+    coverage_sources = _required_list(coverage, "sources")
+    covered_source_ids = {
+        str(item.get("source_id"))
+        for item in coverage_sources
+        if isinstance(item, Mapping)
+    }
+    if covered_source_ids != envelope_ids:
+        raise ValueError("coverage receipt source denominator mismatch")
+    if any(
+        not isinstance(item, Mapping)
+        or item.get("status") != "parsed"
+        or item.get("accessible") is not True
+        for item in coverage_sources
+    ):
+        raise ValueError("coverage receipt contains a non-ready source")
+
+    if not isinstance(assertion_evidence, list) or not assertion_evidence:
+        raise ValueError("assertion evidence must be a non-empty list")
+    assertions = tuple(
+        _require_contract(record, "assertion-evidence.v1")
+        for record in assertion_evidence
+    )
+    generated_candidates = [
+        _required_timestamp(graph, "generated_at"),
+        _required_timestamp(parity, "generated_at"),
+        _required_timestamp(coverage, "generated_at"),
+    ]
+    if generated_at is not None:
+        generated_candidates.append(
+            _required_timestamp({"generated_at": generated_at}, "generated_at"),
+        )
+    generated_time_text, generated_time = max(
+        generated_candidates,
+        key=lambda item: item[1],
+    )
+    if generated_time < snapshot_time:
+        raise ValueError("reconciliation generation window precedes frozen snapshot")
+
+    digest_projection = {
+        "snapshot_id": snapshot_id,
+        "snapshot_digest": snapshot_digest,
+        "snapshot_at": snapshot_at,
+        "generated_at": generated_time_text,
+        "lineage_graph": content_digest(graph),
+        "governance_testament": content_digest(testament),
+        "source_census": content_digest(census),
+        "source_envelopes": content_digest(source_envelopes),
+        "normalized_events": content_digest(normalized_events),
+        "assertion_evidence": content_digest(assertion_evidence),
+        "normalization_parity_receipt": content_digest(parity),
+        "coverage_receipt": content_digest(coverage),
+    }
+    exact_input_digest = content_digest(digest_projection)
+    return ReconcileInputs(
+        snapshot_id=snapshot_id,
+        snapshot_digest=snapshot_digest,
+        snapshot_at=snapshot_time_text,
+        generated_at=generated_time_text,
+        lineage_graph=graph,
+        governance_testament=testament,
+        source_census=census,
+        source_envelopes=tuple(envelopes),
+        normalized_events=tuple(events),
+        assertion_evidence=assertions,
+        normalization_parity_receipt=parity,
+        coverage_receipt=coverage,
+        input_digest=exact_input_digest,
+    )
+
+
+def build_snapshot_evidence_index(inputs: ReconcileInputs) -> SnapshotEvidenceIndex:
+    """Derive the only references allowed in a ready self-image set."""
+    source_references: set[str] = set()
+    evidence_digests: dict[str, str] = {}
+    for envelope in inputs.source_envelopes:
+        source_id = _required_text(envelope, "source_id")
+        aliases = _bound_reference_aliases("source", source_id)
+        source_references.update(aliases)
+        body_hash = _required_text(envelope, "body_hash")
+        evidence_digests.update({alias: body_hash for alias in aliases})
+
+    event_references: set[str] = set()
+    for event in inputs.normalized_events:
+        event_id = _required_text(event, "event_id")
+        aliases = _bound_reference_aliases("event", event_id)
+        event_references.update(aliases)
+        identity_basis = event.get("identity_basis")
+        event_hash = (
+            identity_basis.get("content_hash")
+            if isinstance(identity_basis, Mapping)
+            else event.get("raw_unit_content_hash")
+        )
+        if not isinstance(event_hash, str):
+            raise ValueError(f"normalized event {event_id} lacks a content hash")
+        evidence_digests.update({alias: event_hash for alias in aliases})
+
+    receipt_references: set[str] = set()
+    for receipt, digest_field in (
+        (inputs.normalization_parity_receipt, "receipt_digest"),
+        (inputs.coverage_receipt, "receipt_hash"),
+    ):
+        receipt_id = _required_text(receipt, "receipt_id")
+        if receipt.get(digest_field) != _digest_excluding(receipt, digest_field):
+            raise ValueError(f"predicate receipt {receipt_id} digest mismatch")
+        aliases = _bound_reference_aliases("receipt", receipt_id)
+        if aliases & receipt_references:
+            raise ValueError(f"predicate receipt {receipt_id} is duplicated")
+        receipt_references.update(aliases)
+        receipt_digest = _required_text(receipt, digest_field)
+        evidence_digests.update({alias: receipt_digest for alias in aliases})
+
+    evidence_ids = source_references | event_references | receipt_references
+    _, snapshot_time = _required_timestamp(
+        {"snapshot_at": inputs.snapshot_at},
+        "snapshot_at",
+    )
+    _, generated_time = _required_timestamp(
+        {"generated_at": inputs.generated_at},
+        "generated_at",
+    )
+    assertion_references: set[str] = set()
+    for assertion in inputs.assertion_evidence:
+        assertion_id = _required_text(assertion, "assertion_id")
+        if assertion.get("verification_state") != "verified":
+            raise ValueError(f"assertion {assertion_id} is not verified")
+        freshness = assertion.get("freshness")
+        if not isinstance(freshness, Mapping) or freshness.get("status") != "fresh":
+            raise ValueError(f"assertion {assertion_id} is stale")
+        _, verified_time = _required_timestamp(freshness, "verified_at")
+        if verified_time < snapshot_time or verified_time > generated_time:
+            raise ValueError(
+                f"assertion {assertion_id} verification is outside the snapshot window",
+            )
+        evidence = _required_list(assertion, "evidence_references")
+        if not evidence:
+            raise ValueError(f"assertion {assertion_id} has no evidence")
+        for item in evidence:
+            expected_digest = (
+                _resolve_bound_value(item.get("reference"), evidence_digests)
+                if isinstance(item, Mapping)
+                else None
+            )
+            if (
+                not isinstance(item, Mapping)
+                or not _reference_resolves(item.get("reference"), evidence_ids)
+                or item.get("body_hash") != expected_digest
+            ):
+                raise ValueError(f"assertion {assertion_id} evidence is unresolved")
+        aliases = _bound_reference_aliases("assertion", assertion_id)
+        if aliases & assertion_references:
+            raise ValueError(f"assertion {assertion_id} is duplicated")
+        assertion_references.update(aliases)
+
+    return SnapshotEvidenceIndex(
+        snapshot_id=inputs.snapshot_id,
+        snapshot_digest=inputs.snapshot_digest,
+        snapshot_at=inputs.snapshot_at,
+        generated_at=inputs.generated_at,
+        input_digest=inputs.input_digest,
+        source_references=tuple(sorted(source_references)),
+        event_references=tuple(sorted(event_references)),
+        assertion_references=tuple(sorted(assertion_references)),
+        predicate_receipt_references=tuple(sorted(receipt_references)),
+    )
+
+
 def import_lineage_graph(
     store: RegistryStore,
     value: Any,
@@ -645,9 +1116,9 @@ def export_lineage_graph(
 def validate_self_image_set(
     value: Any,
     *,
-    snapshot_id: str | None = None,
+    evidence_index: SnapshotEvidenceIndex,
 ) -> Mapping[str, Any]:
-    """Validate the public registry denominator and exact-one image binding."""
+    """Validate denominator, snapshot window, and every public evidence edge."""
     image_set = _require_contract(value, SELF_IMAGE_SET_CONTRACT)
     for field_name in (
         "set_id",
@@ -658,8 +1129,11 @@ def validate_self_image_set(
         "set_digest",
     ):
         _required_text(image_set, field_name)
-    if snapshot_id is not None and image_set["snapshot_id"] != snapshot_id:
-        raise ValueError("node self-image set snapshot_id does not match snapshot")
+    if (
+        image_set["snapshot_id"] != evidence_index.snapshot_id
+        or image_set["snapshot_digest"] != evidence_index.snapshot_digest
+    ):
+        raise ValueError("node self-image set snapshot binding mismatch")
     if image_set["registry_reference"] != "#/registry_projection":
         raise ValueError(
             "registry_reference must resolve to the embedded registry_projection",
@@ -709,6 +1183,71 @@ def validate_self_image_set(
             "self_images must derive exactly and in order from registered_node_ids",
         )
 
+    _, snapshot_time = _required_timestamp(
+        {"snapshot_at": evidence_index.snapshot_at},
+        "snapshot_at",
+    )
+    _, generated_time = _required_timestamp(
+        {"generated_at": evidence_index.generated_at},
+        "generated_at",
+    )
+    if generated_time < snapshot_time:
+        raise ValueError("self-image snapshot generation window is invalid")
+    allowed_references = evidence_index.allowed_references
+
+    def require_evidence(references: Any, location: str) -> None:
+        if (
+            not isinstance(references, list)
+            or not references
+            or not all(
+                _reference_resolves(reference, allowed_references)
+                for reference in references
+            )
+        ):
+            raise ValueError(f"{location} has unresolved snapshot evidence")
+
+    for image in images:
+        if not isinstance(image, Mapping):
+            raise ValueError("self_images must contain only objects")
+        _, reconciled_time = _required_timestamp(image, "reconciled_at")
+        if reconciled_time < snapshot_time or reconciled_time > generated_time:
+            raise ValueError("self-image reconciled_at is outside the snapshot window")
+        require_evidence(image.get("evidence_references"), "self-image")
+        relations = image.get("relations")
+        if not isinstance(relations, Mapping):
+            raise ValueError("self-image relations must be an object")
+        for direction in ("incoming", "outgoing"):
+            related = relations.get(direction)
+            if not isinstance(related, list):
+                raise ValueError(f"self-image {direction} relations must be a list")
+            for relation in related:
+                if not isinstance(relation, Mapping):
+                    raise ValueError("self-image relation must be an object")
+                require_evidence(
+                    relation.get("evidence_references"),
+                    "self-image relation",
+                )
+        observations = image.get("observations")
+        if not isinstance(observations, list) or not observations:
+            raise ValueError("self-image observations must be non-empty")
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                raise ValueError("self-image observation must be an object")
+            require_evidence(
+                observation.get("evidence_references"),
+                "self-image observation",
+            )
+        active_ideal_forms = image.get("active_ideal_forms")
+        if not isinstance(active_ideal_forms, list) or not active_ideal_forms:
+            raise ValueError("self-image active ideals must be non-empty")
+        for ideal in active_ideal_forms:
+            if not isinstance(ideal, Mapping):
+                raise ValueError("self-image active ideal must be an object")
+            require_evidence(
+                ideal.get("evidence_references"),
+                "self-image active ideal",
+            )
+
     counts = image_set.get("counts")
     if not isinstance(counts, Mapping):
         raise ValueError("self-image counts must be an object")
@@ -716,6 +1255,20 @@ def validate_self_image_set(
         raise ValueError("counts.registered does not match registry_projection")
     if counts.get("exported") != len(images):
         raise ValueError("counts.exported does not match self_images")
+
+    readiness = image_set.get("readiness")
+    if (
+        not isinstance(readiness, Mapping)
+        or readiness.get("exact_all") is not True
+        or readiness.get("ready") is not True
+        or readiness.get("status") != "ready"
+        or any(
+            not isinstance(readiness.get(field_name), list)
+            or readiness.get(field_name)
+            for field_name in _READINESS_DEBT_FIELDS
+        )
+    ):
+        raise ValueError("node self-image set is not ready")
 
     body = dict(image_set)
     actual_set_digest = body.pop("set_digest")
@@ -727,8 +1280,7 @@ def validate_self_image_set(
 def build_self_image_set(
     store: RegistryStore,
     *,
-    snapshot_id: str,
-    snapshot_digest: str,
+    evidence_index: SnapshotEvidenceIndex,
     reconciled_at: str,
     constitutional_digest: str,
 ) -> dict[str, Any]:
@@ -750,6 +1302,7 @@ def build_self_image_set(
             node_id,
             constitutional_digest=constitutional_digest,
             last_reconciled_at=reconciled_at,
+            allowed_evidence_references=evidence_index.allowed_references,
         ).to_dict()
         for node_id in registered_node_ids
     ]
@@ -768,9 +1321,9 @@ def build_self_image_set(
     body = {
         "contract_name": SELF_IMAGE_SET_CONTRACT,
         "contract_version": 1,
-        "set_id": f"self-images:{snapshot_id}",
-        "snapshot_id": snapshot_id,
-        "snapshot_digest": snapshot_digest,
+        "set_id": f"self-images:{evidence_index.snapshot_id}",
+        "snapshot_id": evidence_index.snapshot_id,
+        "snapshot_digest": evidence_index.snapshot_digest,
         "registry_reference": "#/registry_projection",
         "registry_projection": registry_projection,
         "registry_digest": content_digest(registry_projection),
@@ -793,7 +1346,7 @@ def build_self_image_set(
         "digest_algorithm": "sha256-rfc8785-excluding-self-digest-v1",
     }
     result = {**body, "set_digest": content_digest(body)}
-    validate_self_image_set(result, snapshot_id=snapshot_id)
+    validate_self_image_set(result, evidence_index=evidence_index)
     return result
 
 
@@ -817,53 +1370,47 @@ def _write_if_changed(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def reconcile_snapshot_bundle(
+def reconcile_governance_snapshot(
     store: RegistryStore,
-    bundle: Any,
+    inputs: ReconcileInputs,
     *,
     output_dir: Path,
 ) -> dict[str, Any]:
-    """Reconcile one frozen bundle and persist a typed, idempotent receipt."""
-    snapshot = _require_contract(bundle, SNAPSHOT_BUNDLE_CONTRACT)
-    snapshot_id = _required_text(snapshot, "snapshot_id")
-    snapshot_at = _required_text(snapshot, "snapshot_at")
-    lineage = snapshot.get("lineage_graph")
-    if lineage is None and isinstance(snapshot.get("contracts"), Mapping):
-        lineage = snapshot["contracts"].get("lineage_graph")
-    lineage_graph = validate_lineage_graph(lineage, snapshot_id=snapshot_id)
-    result = import_lineage_graph(store, lineage_graph, snapshot_id=snapshot_id)
-
-    constitutional_digest = snapshot.get("constitutional_digest")
-    if not isinstance(constitutional_digest, str) or not constitutional_digest:
-        testament = snapshot.get("governance_testament")
-        if testament is None and isinstance(snapshot.get("contracts"), Mapping):
-            testament = snapshot["contracts"].get("governance_testament")
-        if testament is None:
-            raise ValueError("snapshot bundle requires constitutional evidence")
-        constitutional_digest = content_digest(testament)
+    """Reconcile exact pre-cadence owner artifacts without a final-bundle cycle."""
+    evidence_index = build_snapshot_evidence_index(inputs)
+    lineage_graph = validate_lineage_graph(
+        inputs.lineage_graph,
+        snapshot_id=inputs.snapshot_id,
+    )
+    result = import_lineage_graph(
+        store,
+        lineage_graph,
+        snapshot_id=inputs.snapshot_id,
+    )
+    constitutional_digest = content_digest(inputs.governance_testament)
 
     exported_lineage = export_lineage_graph(
         store,
-        snapshot_id=snapshot_id,
-        generated_at=snapshot_at,
+        snapshot_id=inputs.snapshot_id,
+        generated_at=inputs.generated_at,
         graph_id=str(lineage_graph["graph_id"]),
     )
     self_image_set = build_self_image_set(
         store,
-        snapshot_id=snapshot_id,
-        snapshot_digest=str(snapshot.get("snapshot_digest") or content_digest(snapshot)),
-        reconciled_at=snapshot_at,
+        evidence_index=evidence_index,
+        reconciled_at=inputs.generated_at,
         constitutional_digest=constitutional_digest,
     )
     receipt = {
         "contract_name": RECONCILIATION_RECEIPT_CONTRACT,
         "contract_version": 1,
-        "receipt_id": f"ontologia-reconcile:{snapshot_id}",
-        "snapshot_id": snapshot_id,
-        "snapshot_at": snapshot_at,
-        "input_digest": str(
-            snapshot.get("_snapshot_bundle_digest") or content_digest(snapshot),
-        ),
+        "receipt_id": f"ontologia-reconcile:{inputs.snapshot_id}",
+        "snapshot_id": inputs.snapshot_id,
+        "snapshot_digest": inputs.snapshot_digest,
+        "snapshot_at": inputs.snapshot_at,
+        "generated_at": inputs.generated_at,
+        "input_digest": inputs.input_digest,
+        "evidence_index_digest": evidence_index.digest,
         "lineage_digest": content_digest(exported_lineage),
         "self_image_set_digest": self_image_set["set_digest"],
         "counts": {
@@ -889,3 +1436,68 @@ def reconcile_snapshot_bundle(
         "node_self_image_set": self_image_set,
         "receipt": receipt,
     }
+
+
+def reconcile_snapshot_bundle(
+    store: RegistryStore,
+    bundle: Any,
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Validate a final bundle and delegate through the acyclic owner interface."""
+    snapshot = _require_contract(bundle, SNAPSHOT_BUNDLE_CONTRACT)
+    missing_fields = [
+        field_name
+        for field_name in _FINAL_BUNDLE_REQUIRED_FIELDS
+        if snapshot.get(field_name) is None
+    ]
+    if missing_fields:
+        raise ValueError(
+            "final governance snapshot bundle is incomplete: "
+            + ", ".join(missing_fields),
+        )
+    readiness = snapshot.get("readiness")
+    if (
+        not isinstance(readiness, Mapping)
+        or readiness.get("exact_all") is not True
+        or readiness.get("ready") is not True
+        or readiness.get("status") != "ready"
+        or any(
+            not isinstance(readiness.get(field_name), list)
+            or readiness.get(field_name)
+            for field_name in _READINESS_DEBT_FIELDS
+        )
+    ):
+        raise ValueError("final governance snapshot bundle is not ready")
+    if (
+        "_snapshot_bundle_digest" not in snapshot
+        and snapshot.get("bundle_digest")
+        != _digest_excluding(snapshot, "bundle_digest")
+    ):
+        raise ValueError("final governance snapshot bundle digest mismatch")
+    raw_contracts = snapshot.get("contracts")
+    contracts: Mapping[str, Any] = (
+        raw_contracts if isinstance(raw_contracts, Mapping) else {}
+    )
+
+    def snapshot_value(field_name: str) -> Any:
+        value = snapshot.get(field_name)
+        return value if value is not None else contracts.get(field_name)
+
+    inputs = build_reconcile_inputs(
+        snapshot_id=_required_text(snapshot, "snapshot_id"),
+        snapshot_digest=_required_text(snapshot, "snapshot_digest"),
+        snapshot_at=_required_text(snapshot, "snapshot_at"),
+        generated_at=_required_text(snapshot, "generated_at"),
+        lineage_graph=snapshot_value("lineage_graph"),
+        governance_testament=snapshot_value("governance_testament"),
+        source_census=snapshot_value("source_census"),
+        source_envelopes=snapshot_value("source_envelopes"),
+        normalized_events=snapshot_value("normalized_events"),
+        assertion_evidence=snapshot_value("assertion_evidence"),
+        normalization_parity_receipt=snapshot_value(
+            "normalization_parity_receipt",
+        ),
+        coverage_receipt=snapshot_value("coverage"),
+    )
+    return reconcile_governance_snapshot(store, inputs, output_dir=output_dir)

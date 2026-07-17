@@ -723,6 +723,7 @@ class RegistryStore:
         *,
         constitutional_digest: str,
         last_reconciled_at: str,
+        allowed_evidence_references: frozenset[str],
     ) -> NodeSelfImage:
         """Project one deterministic self-image from registry-owned evidence."""
         entity = self._entities.get(entity_id)
@@ -731,12 +732,35 @@ class RegistryStore:
         if not constitutional_digest or not last_reconciled_at:
             raise ValueError("self-image requires constitutional digest and reconciliation time")
 
+        def evidence_is_allowed(reference: str) -> bool:
+            return reference in allowed_evidence_references
+
+        def checked_evidence(
+            references: list[str],
+            *,
+            location: str,
+        ) -> list[str]:
+            normalized = sorted({str(reference) for reference in references if reference})
+            if (
+                not normalized
+                or not all(evidence_is_allowed(reference) for reference in normalized)
+            ):
+                raise ValueError(
+                    f"{location} lacks snapshot-bound evidence references",
+                )
+            return normalized
+
         def relation_evidence(payload: dict[str, Any]) -> list[str]:
             metadata = payload.get("metadata", {})
             configured = metadata.get("evidence_references", [])
             if isinstance(configured, list) and configured:
-                return sorted({str(reference) for reference in configured})
-            return [f"registry-edge:{content_digest(payload)}"]
+                return checked_evidence(
+                    [str(reference) for reference in configured],
+                    location="registry relation",
+                )
+            raise ValueError(
+                "registry relation lacks snapshot-bound evidence references",
+            )
 
         parent = self._edge_index.parent(entity_id, at=last_reconciled_at)
         incoming: list[dict[str, Any]] = []
@@ -781,9 +805,9 @@ class RegistryStore:
         linked_nodes = self._authority_graph.nodes_for_entity(entity_id)
         linked_node_ids = {node.node_id for node in linked_nodes}
         for edge in self._authority_graph.edges():
-            references = sorted(
-                {span.source_id for span in edge.evidence}
-                or {f"governance-edge:{edge.edge_id}"},
+            references = checked_evidence(
+                sorted({span.source_id for span in edge.evidence}),
+                location=f"governance relation {edge.edge_id}",
             )
             if edge.target_node_id in linked_node_ids:
                 incoming.append(
@@ -826,12 +850,15 @@ class RegistryStore:
         observations: list[dict[str, Any]] = []
         for metric_id in sorted(latest_observations):
             observation = latest_observations[metric_id]
-            payload = observation.to_dict()
             configured = observation.metadata.get("evidence_references", [])
             references = (
                 sorted({str(reference) for reference in configured})
                 if isinstance(configured, list) and configured
-                else [f"observation:{content_digest(payload)}"]
+                else []
+            )
+            references = checked_evidence(
+                references,
+                location=f"observation {observation.metric_id}",
             )
             observations.append(
                 {
@@ -888,16 +915,20 @@ class RegistryStore:
                 implementation_state = "partial"
             else:
                 implementation_state = "not_started"
+            ideal_evidence = checked_evidence(
+                sorted(
+                    {span.source_id for span in node.evidence}
+                    | receipt_references,
+                ),
+                location=f"active ideal form {ideal_form_id}",
+            )
             ideals.append(
                 {
                     "form_id": str(ideal_form_id),
                     "implementation_state": implementation_state,
                     "distance_to_ideal": distance,
                     "predicate_references": sorted(predicate_ids),
-                    "evidence_references": sorted(
-                        {span.source_id for span in node.evidence}
-                        | receipt_references,
-                    ),
+                    "evidence_references": ideal_evidence,
                 },
             )
         ideals.sort(key=canonical_json)
@@ -917,7 +948,13 @@ class RegistryStore:
             {span.source_id for node in linked_nodes for span in node.evidence},
         )
         if not source_references:
-            source_references = [f"entity:{content_digest(entity.to_dict())}"]
+            raise ValueError(
+                f"registered node {entity_id} lacks snapshot-bound source evidence",
+            )
+        source_references = checked_evidence(
+            source_references,
+            location=f"registered node {entity_id}",
+        )
 
         return NodeSelfImage(
             node_id=entity_id,
@@ -997,9 +1034,16 @@ class RegistryStore:
         entity_id: str,
         value: float,
         source: str = "system",
+        metadata: dict[str, Any] | None = None,
     ) -> Observation:
         """Record a metric observation (persisted immediately to JSONL)."""
-        return self.observation_store.observe(metric_id, entity_id, value, source)
+        return self.observation_store.observe(
+            metric_id,
+            entity_id,
+            value,
+            source,
+            metadata,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
