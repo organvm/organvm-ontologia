@@ -130,6 +130,7 @@ def create_entity(
     created_by: str = "system",
     metadata: dict[str, Any] | None = None,
     timestamp_ms: int | None = None,
+    created_at: str | None = None,
 ) -> EntityIdentity:
     """Create a new entity with a fresh UID.
 
@@ -138,14 +139,23 @@ def create_entity(
         created_by: Who or what created this entity.
         metadata: Optional metadata to attach.
         timestamp_ms: Optional timestamp for deterministic UID generation.
+        created_at: Optional explicit creation timestamp for snapshot-bound imports.
 
     Returns:
         A new EntityIdentity with a unique UID.
     """
     uid = generate_entity_uid(entity_type, timestamp_ms=timestamp_ms)
+    if created_at is None:
+        return EntityIdentity(
+            uid=uid,
+            entity_type=entity_type,
+            created_by=created_by,
+            metadata=metadata or {},
+        )
     return EntityIdentity(
         uid=uid,
         entity_type=entity_type,
+        created_at=created_at,
         created_by=created_by,
         metadata=metadata or {},
     )

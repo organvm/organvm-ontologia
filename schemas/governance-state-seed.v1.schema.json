@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://organvm.github.io/organvm-ontologia/governance-state-seed.v1.schema.json",
+  "title": "Governance State Seed v1",
+  "description": "Private, snapshot-bound entity declarations used to seed Ontologia before reviewed lineage import.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "snapshot_id",
+    "snapshot_at",
+    "entities"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "governance-state-seed.v1"
+    },
+    "contract_version": {
+      "const": 1
+    },
+    "snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "external_id",
+          "entity_type",
+          "display_name",
+          "owner_reference"
+        ],
+        "properties": {
+          "external_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "organ",
+              "repo",
+              "module",
+              "document",
+              "session",
+              "variable",
+              "metric"
+            ]
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "owner_reference": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

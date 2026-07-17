@@ -104,15 +104,26 @@ class ObservationStore:
         value: float,
         source: str = "system",
         metadata: dict[str, Any] | None = None,
+        timestamp: str | None = None,
     ) -> Observation:
         """Convenience: create and record an observation."""
-        obs = Observation(
-            metric_id=metric_id,
-            entity_id=entity_id,
-            value=value,
-            source=source,
-            metadata=metadata or {},
-        )
+        if timestamp is None:
+            obs = Observation(
+                metric_id=metric_id,
+                entity_id=entity_id,
+                value=value,
+                source=source,
+                metadata=metadata or {},
+            )
+        else:
+            obs = Observation(
+                metric_id=metric_id,
+                entity_id=entity_id,
+                value=value,
+                timestamp=timestamp,
+                source=source,
+                metadata=metadata or {},
+            )
         self.record(obs)
         return obs
 

@@ -309,6 +309,7 @@ class RegistryStore:
         created_by: str = "system",
         metadata: dict[str, Any] | None = None,
         timestamp_ms: int | None = None,
+        created_at: str | None = None,
     ) -> EntityIdentity:
         """Create a new entity with identity and initial name.
 
@@ -318,6 +319,7 @@ class RegistryStore:
             created_by: Creator identifier.
             metadata: Optional metadata dict.
             timestamp_ms: Optional deterministic timestamp for UID.
+            created_at: Optional explicit creation and initial-name timestamp.
 
         Returns:
             The new EntityIdentity.
@@ -327,6 +329,7 @@ class RegistryStore:
             created_by=created_by,
             metadata=metadata,
             timestamp_ms=timestamp_ms,
+            created_at=created_at,
         )
         self._entities[entity.uid] = entity
         self._dirty = True
@@ -338,6 +341,7 @@ class RegistryStore:
             display_name,
             is_primary=True,
             source=created_by,
+            valid_from=created_at,
         )
         self._append_name(name_record)
 
@@ -1035,6 +1039,7 @@ class RegistryStore:
         value: float,
         source: str = "system",
         metadata: dict[str, Any] | None = None,
+        timestamp: str | None = None,
     ) -> Observation:
         """Record a metric observation (persisted immediately to JSONL)."""
         return self.observation_store.observe(
@@ -1043,6 +1048,7 @@ class RegistryStore:
             value,
             source,
             metadata,
+            timestamp,
         )
 
     # ------------------------------------------------------------------

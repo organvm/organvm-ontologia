@@ -15,6 +15,7 @@ from ontologia.governance.reconcile import (
     reconcile_governance_snapshot,
     reconcile_snapshot_bundle,
 )
+from ontologia.governance.state_seed import seed_governance_state
 from ontologia.registry.store import open_store
 
 
@@ -39,6 +40,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Import, reconcile, and export reviewed governance memory",
     )
     governance_commands = governance.add_subparsers(dest="governance_command", required=True)
+
+    seed_state = governance_commands.add_parser(
+        "seed-state",
+        help="Seed or verify an exact pre-import governance entity denominator",
+    )
+    seed_state.add_argument("--lineage", required=True)
+    seed_state.add_argument("--coverage", required=True)
+    seed_state.add_argument("--normalization-parity", required=True)
+    seed_state.add_argument("--seed", required=True)
+    seed_state.add_argument("--snapshot-id", required=True)
+    seed_state.add_argument("--snapshot-at", required=True)
+    seed_state.add_argument("--state-root", required=True)
+    seed_state.add_argument("--resolved-lineage-out", required=True)
+    seed_state.add_argument("--crosswalk-out", required=True)
+    seed_state.add_argument("--max-input-bytes", type=int, default=16_777_216)
+    seed_state.add_argument("--max-entities", type=int, default=100_000)
 
     reconcile = governance_commands.add_parser(
         "reconcile",
@@ -95,6 +112,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command != "governance":
         return 2
+    if args.governance_command == "seed-state":
+        try:
+            result = seed_governance_state(
+                lineage_graph=_load_json(args.lineage, args.max_input_bytes),
+                coverage_receipt=_load_json(args.coverage, args.max_input_bytes),
+                normalization_parity_receipt=_load_json(
+                    args.normalization_parity,
+                    args.max_input_bytes,
+                ),
+                seed=_load_json(args.seed, args.max_input_bytes),
+                snapshot_id=args.snapshot_id,
+                snapshot_at=args.snapshot_at,
+                state_root=Path(args.state_root),
+                resolved_lineage_out=Path(args.resolved_lineage_out),
+                crosswalk_out=Path(args.crosswalk_out),
+                max_entities=args.max_entities,
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        _print_json(result.summary())
+        return 0
     store = open_store(Path(args.state_root))
     if args.governance_command == "reconcile":
         if args.snapshot_bundle:

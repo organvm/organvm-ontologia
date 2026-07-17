@@ -1,0 +1,278 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://organvm.github.io/organvm-ontologia/governance-entity-crosswalk.v1.schema.json",
+  "title": "Governance Entity Crosswalk v1",
+  "description": "Private persisted binding from source-owned external identifiers to Ontologia entity UIDs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_name",
+    "contract_version",
+    "crosswalk_id",
+    "snapshot_id",
+    "snapshot_at",
+    "seed_digest",
+    "lineage_input_digest",
+    "resolved_lineage_digest",
+    "state_file_digests",
+    "receipt_bindings",
+    "entries",
+    "counts",
+    "digest_algorithm",
+    "crosswalk_digest"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "governance-entity-crosswalk.v1"
+    },
+    "contract_version": {
+      "const": 1
+    },
+    "crosswalk_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshot_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "seed_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "lineage_input_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "resolved_lineage_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "state_file_digests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entities.json",
+        "events.jsonl",
+        "metrics.json",
+        "names.jsonl",
+        "observations.jsonl",
+        "variables.json"
+      ],
+      "properties": {
+        "entities.json": {
+          "$ref": "#/$defs/digest"
+        },
+        "events.jsonl": {
+          "$ref": "#/$defs/digest"
+        },
+        "metrics.json": {
+          "$ref": "#/$defs/digest"
+        },
+        "names.jsonl": {
+          "$ref": "#/$defs/digest"
+        },
+        "observations.jsonl": {
+          "$ref": "#/$defs/digest"
+        },
+        "variables.json": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "receipt_bindings": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/coverageReceiptBinding"
+        },
+        {
+          "$ref": "#/$defs/parityReceiptBinding"
+        }
+      ],
+      "items": false
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "external_id",
+          "entity_id",
+          "entity_type",
+          "display_name",
+          "owner_reference",
+          "representative_node_id",
+          "source_envelope_id",
+          "observation_metric_id",
+          "ideal_form_id"
+        ],
+        "properties": {
+          "external_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "entity_id": {
+            "type": "string",
+            "pattern": "^ent_[a-z]+_[0-9A-HJKMNP-TV-Z]{26}$"
+          },
+          "entity_type": {
+            "type": "string",
+            "enum": [
+              "organ",
+              "repo",
+              "module",
+              "document",
+              "session",
+              "variable",
+              "metric"
+            ]
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "owner_reference": {
+            "type": "string",
+            "minLength": 1
+          },
+          "representative_node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_envelope_id": {
+            "type": "string",
+            "pattern": "^src_[A-Za-z0-9_-]+$"
+          },
+          "observation_metric_id": {
+            "const": "metric:governance-source-evidence-present"
+          },
+          "ideal_form_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "external_entities",
+        "registered_entities",
+        "resolved_lineage_nodes"
+      ],
+      "properties": {
+        "external_entities": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "registered_entities": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resolved_lineage_nodes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "digest_algorithm": {
+      "const": "sha256-rfc8785-excluding-self-digest-v1"
+    },
+    "crosswalk_digest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "coverageReceiptBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_name",
+        "receipt_id",
+        "receipt_digest",
+        "reference",
+        "ready",
+        "result"
+      ],
+      "properties": {
+        "contract_name": {
+          "const": "coverage-receipt.v1"
+        },
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "reference": {
+          "type": "string",
+          "pattern": "^receipt:.+"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "parityReceiptBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_name",
+        "receipt_id",
+        "receipt_digest",
+        "snapshot_digest",
+        "reference",
+        "ready",
+        "result"
+      ],
+      "properties": {
+        "contract_name": {
+          "const": "normalization-parity-receipt.v1"
+        },
+        "receipt_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "snapshot_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "reference": {
+          "type": "string",
+          "pattern": "^receipt:.+"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "blocked"
+          ]
+        }
+      }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  }
+}

@@ -18,3 +18,6 @@ fail closed. The bounded Limen reconcile-stage owner can materialize an
 `exact_all` snapshot with owner-routed debt without turning that debt into
 `ready`. Its execution, resume, proof, and predicate interfaces are documented
 in [`docs/governance-cadence-reconcile.md`](docs/governance-cadence-reconcile.md).
+The pre-import entity denominator and durable external-ID crosswalk are owned
+by `ontologia governance seed-state`; see
+[`docs/governance-state-seed.md`](docs/governance-state-seed.md).

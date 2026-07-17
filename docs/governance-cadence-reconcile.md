@@ -5,6 +5,11 @@ classification and testament distillation. The stage consumes one frozen
 snapshot through the direct, acyclic reconciliation interface. It never reads
 an Atlas or final cadence bundle.
 
+Before the first traversal, seed or verify the exact registered-entity
+denominator with `ontologia governance seed-state`. The seed-state contract,
+external-ID crosswalk, and the prohibition on pre-importing authority nodes are
+documented in [`governance-state-seed.md`](governance-state-seed.md).
+
 The ordinary direct CLI remains strict:
 
 ```bash
