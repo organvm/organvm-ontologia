@@ -1440,6 +1440,72 @@ def test_snapshot_evidence_index_rejects_unbound_assertion_evidence(
         build_snapshot_evidence_index(tampered)
 
 
+def test_ratified_directive_uses_event_bound_freshness_and_extends_generation() -> None:
+    graph = {
+        "contract_name": "lineage-graph.v1",
+        "contract_version": 1,
+        "graph_id": "lineage:event-bound-directive",
+        "generated_at": GENERATED,
+        "frozen_snapshot_id": SNAPSHOT,
+        "nodes": [
+            {
+                "node_id": "intent:event-bound-directive",
+                "lane": "operator_intent",
+                "node_type": "source_event",
+                "source_envelope_id": "src_event_1",
+                "occurred_at": OBSERVED,
+                "authority_class": "operator_intent",
+                "summary": "Ratified directive fixture.",
+                "content_hash": BODY_HASH,
+                "review_state": "reviewed",
+            },
+        ],
+        "edges": [],
+    }
+    original = _pre_cadence_inputs(graph, source_ids=("src_event_1",))
+    ratified_at = "2099-07-16T12:06:00Z"
+    ratification = {
+        "constitutional_record_reference": "constitution:amendment-l",
+        "constitutional_coverage": deepcopy(
+            original.coverage_receipt["constitutional_scope"],
+        ),
+    }
+    testament = deepcopy(original.governance_testament)
+    testament["status"] = "ratified"
+    testament["ratification"] = ratification
+    assertions = [deepcopy(item) for item in original.assertion_evidence]
+    assertions[0]["assertion_class"] = "operator_directive"
+    assertions[0]["freshness"] = {
+        "verified_at": ratified_at,
+        "status": "not_applicable",
+    }
+    assertions[0]["evidence_references"].append(
+        {
+            "evidence_id": "constitutional-amendment-l",
+            "independence_group": "constitutional-chain",
+            "evidence_type": "ratified_constitutional_record",
+            "reference": "constitution:amendment-l",
+            "body_hash": content_digest(ratification),
+        },
+    )
+    inputs = build_reconcile_inputs(
+        snapshot_id=original.snapshot_id,
+        snapshot_digest=original.snapshot_digest,
+        snapshot_at=original.snapshot_at,
+        lineage_graph=original.lineage_graph,
+        governance_testament=testament,
+        source_census=original.source_census,
+        source_envelopes=list(original.source_envelopes),
+        normalized_events=list(original.normalized_events),
+        assertion_evidence=assertions,
+        normalization_parity_receipt=original.normalization_parity_receipt,
+        coverage_receipt=original.coverage_receipt,
+    )
+
+    assert inputs.generated_at == ratified_at
+    build_snapshot_evidence_index(inputs)
+
+
 def test_final_bundle_path_does_not_accept_pre_cadence_partial_input(
     store: RegistryStore,
     tmp_path: Path,

@@ -1285,6 +1285,16 @@ def build_reconcile_inputs(
         _required_timestamp(parity, "generated_at"),
         _required_timestamp(coverage, "generated_at"),
     ]
+    for assertion in assertions:
+        freshness = assertion.get("freshness")
+        if (
+            assertion.get("verification_state") == "verified"
+            and isinstance(freshness, Mapping)
+            and freshness.get("verified_at")
+        ):
+            generated_candidates.append(
+                _required_timestamp(freshness, "verified_at"),
+            )
     if generated_at is not None:
         generated_candidates.append(
             _required_timestamp({"generated_at": generated_at}, "generated_at"),
@@ -1380,7 +1390,22 @@ def build_snapshot_evidence_index(
         receipt_digest = _required_text(receipt, digest_field)
         evidence_digests.update({alias: receipt_digest for alias in aliases})
 
-    evidence_ids = source_references | event_references | receipt_references
+    constitutional_references: set[str] = set()
+    ratification = inputs.governance_testament.get("ratification")
+    if isinstance(ratification, Mapping):
+        constitutional_reference = _required_text(
+            ratification,
+            "constitutional_record_reference",
+        )
+        constitutional_references.add(constitutional_reference)
+        evidence_digests[constitutional_reference] = content_digest(ratification)
+
+    evidence_ids = (
+        source_references
+        | event_references
+        | receipt_references
+        | constitutional_references
+    )
     _, snapshot_time = _required_timestamp(
         {"snapshot_at": inputs.snapshot_at},
         "snapshot_at",
@@ -1399,13 +1424,40 @@ def build_snapshot_evidence_index(
             raise ValueError(f"assertion {assertion_id} is not verified")
         freshness = assertion.get("freshness")
         if verification_state == "verified":
-            if not isinstance(freshness, Mapping) or freshness.get("status") != "fresh":
+            evidence = _required_list(assertion, "evidence_references")
+            freshness_status = (
+                freshness.get("status") if isinstance(freshness, Mapping) else None
+            )
+            event_bound = bool(
+                freshness_status == "not_applicable"
+                and assertion.get("assertion_class")
+                in {"operator_directive", "ratified_axiom"}
+                and any(
+                    isinstance(item, Mapping)
+                    and item.get("evidence_type")
+                    == "ratified_constitutional_record"
+                    for item in evidence
+                ),
+            )
+            if freshness_status != "fresh" and not event_bound:
+                raise ValueError(f"assertion {assertion_id} is stale")
+            if not isinstance(freshness, Mapping):
                 raise ValueError(f"assertion {assertion_id} is stale")
             _, verified_time = _required_timestamp(freshness, "verified_at")
             if verified_time < snapshot_time or verified_time > generated_time:
                 raise ValueError(
                     f"assertion {assertion_id} verification is outside the snapshot window",
                 )
+            if freshness_status == "fresh":
+                max_age_seconds = freshness.get("max_age_seconds")
+                if (
+                    not isinstance(max_age_seconds, int)
+                    or isinstance(max_age_seconds, bool)
+                    or max_age_seconds <= 0
+                    or (generated_time - verified_time).total_seconds()
+                    > max_age_seconds
+                ):
+                    raise ValueError(f"assertion {assertion_id} is stale")
         evidence = _required_list(assertion, "evidence_references")
         if not evidence:
             raise ValueError(f"assertion {assertion_id} has no evidence")
