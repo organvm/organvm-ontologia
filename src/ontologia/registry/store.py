@@ -847,36 +847,56 @@ class RegistryStore:
             ideal_form_id = node.metadata.get("ideal_form_id")
             if ideal_form_id is None or node.metadata.get("active", True) is False:
                 continue
-            predicate = node.metadata.get("predicate")
-            if not isinstance(predicate, str) or not predicate:
-                raise ValueError(f"active ideal form {ideal_form_id} lacks a predicate")
-            distance = float(node.metadata.get("distance_to_ideal", 1.0))
-            if not 0 <= distance <= 1:
-                raise ValueError(f"active ideal form {ideal_form_id} has invalid distance")
-            implementation_state = str(
-                node.metadata.get("implementation_state", "not_started"),
-            )
-            valid_states = {
-                "not_started",
-                "partial",
-                "implemented",
-                "verified",
-                "blocked",
-                "superseded",
-            }
-            if implementation_state not in valid_states:
+            receipts = node.metadata.get("predicate_receipts")
+            if not isinstance(receipts, list) or not receipts:
                 raise ValueError(
-                    f"active ideal form {ideal_form_id} has invalid implementation state",
+                    f"active ideal form {ideal_form_id} lacks predicate receipts",
                 )
+            predicate_ids: list[str] = []
+            receipt_references: set[str] = set()
+            passed = 0
+            blocked = False
+            for receipt in receipts:
+                if not isinstance(receipt, dict):
+                    raise ValueError(
+                        f"active ideal form {ideal_form_id} has an invalid predicate receipt",
+                    )
+                predicate_id = receipt.get("predicate_id")
+                receipt_reference = receipt.get("receipt_reference")
+                result = receipt.get("result")
+                if (
+                    not isinstance(predicate_id, str)
+                    or not predicate_id
+                    or not isinstance(receipt_reference, str)
+                    or not receipt_reference
+                    or result not in {"pass", "fail", "blocked"}
+                ):
+                    raise ValueError(
+                        f"active ideal form {ideal_form_id} has an invalid predicate receipt",
+                    )
+                predicate_ids.append(predicate_id)
+                receipt_references.add(receipt_reference)
+                passed += result == "pass"
+                blocked = blocked or result == "blocked"
+            total = len(receipts)
+            distance = (total - passed) / total
+            if blocked:
+                implementation_state = "blocked"
+            elif passed == total:
+                implementation_state = "verified"
+            elif passed:
+                implementation_state = "partial"
+            else:
+                implementation_state = "not_started"
             ideals.append(
                 {
                     "form_id": str(ideal_form_id),
                     "implementation_state": implementation_state,
                     "distance_to_ideal": distance,
-                    "predicate_references": [predicate],
+                    "predicate_references": sorted(predicate_ids),
                     "evidence_references": sorted(
                         {span.source_id for span in node.evidence}
-                        | ({str(node.metadata["receipt"])} if node.metadata.get("receipt") else set()),
+                        | receipt_references,
                     ),
                 },
             )

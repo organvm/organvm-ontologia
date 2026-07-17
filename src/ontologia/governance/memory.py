@@ -8,15 +8,16 @@ intent distinct from generated artifacts without replacing those substrates.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Iterable
 
+import rfc8785
+
 
 def canonical_json(value: Any) -> str:
-    """Return a stable JSON representation used by all governance digests."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    """Return RFC 8785 canonical JSON used by all governed digests."""
+    return rfc8785.dumps(value).decode("utf-8")
 
 
 def content_digest(value: Any) -> str:
