@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,6 +71,33 @@ _READINESS_DEBT_FIELDS = (
     "missing_requirements",
     "citation_debt",
     "incomplete_predicates",
+)
+_COVERAGE_STATUSES = (
+    "acquired",
+    "parsed",
+    "quarantined",
+    "inaccessible",
+    "missing_expected",
+    "owner_blocked",
+)
+_COVERAGE_KEYS = frozenset(
+    {
+        "contract_name",
+        "contract_version",
+        "receipt_id",
+        "snapshot_id",
+        "generated_at",
+        "denominator",
+        "sources",
+        "counts",
+        "constitutional_scope",
+        "exact_all",
+        "ready",
+        *_READINESS_DEBT_FIELDS,
+        "closure_status",
+        "residual_owners",
+        "receipt_hash",
+    },
 )
 _PUBLIC_METADATA_KEYS = {
     "active",
@@ -687,6 +715,222 @@ def _combined_readiness(
     return result
 
 
+def _validate_lineage_coverage(
+    coverage: Mapping[str, Any],
+    *,
+    expected_source_ids: set[str],
+) -> None:
+    """Validate CORPVS lineage-source coverage independently of raw-unit parity."""
+    if set(coverage) != _COVERAGE_KEYS:
+        raise ValueError("coverage receipt contains unsupported or missing fields")
+    sources = _required_list(coverage, "sources")
+    if not sources:
+        raise ValueError("coverage receipt source denominator is empty")
+    source_ids: list[str] = []
+    counts: Counter[str] = Counter()
+    expected_residuals: dict[str, dict[str, str]] = {}
+    source_debt: dict[str, set[str]] = {field_name: set() for field_name in _READINESS_DEBT_FIELDS}
+    base_keys = {"source_id", "status", "accessible", "evidence_references"}
+    owner_keys = {"owner_reference", "failed_predicate", "next_action"}
+    accessibility = {
+        "acquired": True,
+        "parsed": True,
+        "quarantined": True,
+        "inaccessible": False,
+        "missing_expected": False,
+        "owner_blocked": False,
+    }
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise ValueError("coverage receipt source denominator is invalid")
+        status = source.get("status")
+        if status not in _COVERAGE_STATUSES:
+            raise ValueError("coverage receipt source status is invalid")
+        expected_keys = base_keys if status == "parsed" else base_keys | owner_keys
+        if set(source) != expected_keys:
+            raise ValueError("coverage receipt source has unsupported or missing fields")
+        source_id = _required_text(source, "source_id")
+        if not _SOURCE_ID_PATTERN.fullmatch(source_id):
+            raise ValueError("coverage receipt source ID is invalid")
+        evidence = source.get("evidence_references")
+        if (
+            not isinstance(evidence, list)
+            or not evidence
+            or len(evidence) != len(set(map(str, evidence)))
+            or not all(isinstance(reference, str) and reference for reference in evidence)
+        ):
+            raise ValueError("coverage receipt source evidence is invalid")
+        if source.get("accessible") is not accessibility[str(status)]:
+            raise ValueError("coverage receipt source accessibility contradicts status")
+        source_ids.append(source_id)
+        counts[str(status)] += 1
+        if status != "parsed":
+            expected_residuals[source_id] = {
+                field_name: _required_text(source, field_name) for field_name in owner_keys
+            }
+        if status in {"inaccessible", "owner_blocked"}:
+            source_debt["unresolved_blockers"].add(source_id)
+        elif status == "quarantined":
+            source_debt["quarantines"].add(source_id)
+        elif status == "missing_expected":
+            source_debt["missing_requirements"].add(source_id)
+        elif status == "acquired":
+            source_debt["incomplete_predicates"].add(source_id)
+    if len(source_ids) != len(set(source_ids)) or set(source_ids) != expected_source_ids:
+        raise ValueError("coverage receipt does not exactly cover lineage source envelopes")
+
+    denominator = coverage.get("denominator")
+    if (
+        not isinstance(denominator, Mapping)
+        or set(denominator) != {"discovery_manifest_reference", "count", "manifest_hash"}
+        or not isinstance(denominator.get("discovery_manifest_reference"), str)
+        or not denominator.get("discovery_manifest_reference")
+        or denominator.get("count") != len(sources)
+        or denominator.get("manifest_hash") != content_digest(sources)
+    ):
+        raise ValueError("coverage receipt source denominator mismatch")
+    declared_counts = coverage.get("counts")
+    expected_counts = {status: counts.get(status, 0) for status in _COVERAGE_STATUSES}
+    if (
+        not isinstance(declared_counts, Mapping)
+        or set(declared_counts) != set(_COVERAGE_STATUSES)
+        or dict(declared_counts) != expected_counts
+    ):
+        raise ValueError("coverage receipt classification counts mismatch")
+
+    residuals = coverage.get("residual_owners")
+    if not isinstance(residuals, list):
+        raise ValueError("coverage receipt residual owners are invalid")
+    actual_residuals: dict[str, dict[str, str]] = {}
+    for residual in residuals:
+        if not isinstance(residual, Mapping) or set(residual) != {"source_id", *owner_keys}:
+            raise ValueError("coverage receipt residual owners are invalid")
+        source_id = _required_text(residual, "source_id")
+        if source_id in actual_residuals:
+            raise ValueError("coverage receipt residual owners are duplicated")
+        actual_residuals[source_id] = {
+            field_name: _required_text(residual, field_name) for field_name in owner_keys
+        }
+    if actual_residuals != expected_residuals:
+        raise ValueError("coverage receipt residual owners are not exact")
+
+    normalized_readiness = _normalize_readiness(
+        {
+            "exact_all": coverage.get("exact_all"),
+            "ready": coverage.get("ready"),
+            "status": coverage.get("closure_status"),
+            **{field_name: coverage.get(field_name) for field_name in _READINESS_DEBT_FIELDS},
+        },
+        label="coverage receipt",
+    )
+    if normalized_readiness["exact_all"] is not True:
+        raise ValueError("coverage receipt is not exact_all")
+    for field_name, expected in source_debt.items():
+        if not expected <= set(normalized_readiness[field_name]):
+            raise ValueError(f"coverage receipt omits {field_name} source debt")
+
+    scope = coverage.get("constitutional_scope")
+    if (
+        not isinstance(scope, Mapping)
+        or set(scope)
+        != {
+            "scope_reference",
+            "exact_all",
+            "blocked_scopes",
+            "missing_requirements",
+            "ready",
+        }
+        or not isinstance(scope.get("scope_reference"), str)
+        or not scope.get("scope_reference")
+    ):
+        raise ValueError("coverage constitutional_scope is invalid")
+    blocked_scopes = scope.get("blocked_scopes")
+    missing_scope_requirements = scope.get("missing_requirements")
+    if (
+        not isinstance(blocked_scopes, list)
+        or len(blocked_scopes) != len(set(map(str, blocked_scopes)))
+        or not all(isinstance(item, str) and item for item in blocked_scopes)
+        or not isinstance(missing_scope_requirements, list)
+        or len(missing_scope_requirements) != len(set(map(str, missing_scope_requirements)))
+        or not all(isinstance(item, str) and item for item in missing_scope_requirements)
+    ):
+        raise ValueError("coverage constitutional_scope debt is invalid")
+    expected_blocked_scopes = sorted(expected_residuals)
+    scope_ready = (
+        normalized_readiness["exact_all"]
+        and not expected_blocked_scopes
+        and not missing_scope_requirements
+    )
+    if (
+        scope.get("exact_all") is not normalized_readiness["exact_all"]
+        or sorted(blocked_scopes) != expected_blocked_scopes
+        or scope.get("ready") is not scope_ready
+        or not set(missing_scope_requirements) <= set(normalized_readiness["missing_requirements"])
+    ):
+        raise ValueError("coverage constitutional_scope contradicts source coverage")
+    expected_ready = (
+        normalized_readiness["exact_all"]
+        and expected_counts["parsed"] == len(sources)
+        and not expected_residuals
+        and not any(normalized_readiness[field_name] for field_name in _READINESS_DEBT_FIELDS)
+        and scope_ready
+    )
+    if normalized_readiness["ready"] is not expected_ready:
+        raise ValueError("coverage receipt ready contradicts its owner predicates")
+
+
+def _validate_receipt_pair_debt(
+    *,
+    coverage_readiness: Mapping[str, Any],
+    parity_readiness: Mapping[str, Any],
+    parity_receipt_id: str,
+) -> None:
+    """Require CORPVS to bind debt from the exact CCE parity receipt."""
+    for field_name in _READINESS_DEBT_FIELDS:
+        coverage_debt = set(coverage_readiness[field_name])
+        parity_reference = f"receipt:{parity_receipt_id}#/readiness/{field_name}"
+        stale_parity_references = {
+            reference
+            for reference in coverage_debt
+            if reference.startswith("receipt:normalization-parity-")
+            and reference.endswith(f"#/readiness/{field_name}")
+            and reference != parity_reference
+        }
+        if stale_parity_references:
+            raise ValueError(f"coverage {field_name} binds a stale parity receipt")
+        if bool(parity_readiness[field_name]) != (parity_reference in coverage_debt):
+            raise ValueError(
+                f"coverage {field_name} does not bind parity readiness debt",
+            )
+
+
+def _validate_testament_constitutional_scope(
+    testament: Mapping[str, Any],
+    coverage: Mapping[str, Any],
+) -> None:
+    """Prevent ratification claims from outrunning constitutional coverage."""
+    status = _required_text(testament, "status")
+    if status not in {"candidate", "ratified"}:
+        raise ValueError("governance testament status is invalid")
+    if status == "candidate":
+        return
+    scope = coverage["constitutional_scope"]
+    ratification = testament.get("ratification")
+    ratified_scope = (
+        ratification.get("constitutional_coverage") if isinstance(ratification, Mapping) else None
+    )
+    if (
+        scope.get("exact_all") is not True
+        or scope.get("ready") is not True
+        or scope.get("blocked_scopes")
+        or scope.get("missing_requirements")
+        or ratified_scope != scope
+    ):
+        raise ValueError(
+            "ratified testament requires identical ready constitutional coverage",
+        )
+
+
 def _source_reference_aliases(
     envelope: Mapping[str, Any],
     *,
@@ -937,8 +1181,23 @@ def build_reconcile_inputs(
         raise ValueError("normalization parity promotion crosswalk mismatch")
     promotion_by_raw_unit: dict[str, Mapping[str, Any]] = {}
     promoted_event_ids: set[str] = set()
+    disposition_raw_ids: dict[str, set[str]] = {
+        "blocked": set(),
+        "quarantined": set(),
+        "ignored_transport_echo": set(),
+        "unsupported": set(),
+    }
     for promotion in promotions:
         if not isinstance(promotion, Mapping):
+            raise ValueError("normalization parity promotion crosswalk mismatch")
+        has_events = "event_ids" in promotion
+        has_disposition = "disposition" in promotion
+        expected_promotion_keys = {
+            "raw_unit_id",
+            "raw_unit_content_hash",
+            "event_ids" if has_events else "disposition",
+        }
+        if has_events is has_disposition or set(promotion) != expected_promotion_keys:
             raise ValueError("normalization parity promotion crosswalk mismatch")
         raw_unit_id = _required_text(promotion, "raw_unit_id")
         if raw_unit_id in promotion_by_raw_unit:
@@ -956,69 +1215,61 @@ def build_reconcile_inputs(
             if promoted_event_ids & set(promotion_events):
                 raise ValueError("normalization parity event is promoted more than once")
             promoted_event_ids.update(promotion_events)
-        elif (
-            not allow_blocked
-            or not isinstance(disposition, Mapping)
-            or disposition.get("type") not in {"blocked", "quarantined"}
-        ):
+        elif not allow_blocked or not isinstance(disposition, Mapping):
             raise ValueError("normalization parity promotion crosswalk mismatch")
+        else:
+            disposition_type = disposition.get("type")
+            if disposition_type not in disposition_raw_ids or set(disposition) != {
+                "type",
+                "owner_reference",
+                "failed_predicate",
+                "next_action",
+                "evidence_references",
+            }:
+                raise ValueError("normalization parity disposition is invalid")
+            for field_name in ("owner_reference", "failed_predicate", "next_action"):
+                _required_text(disposition, field_name)
+            evidence_references = disposition.get("evidence_references")
+            if (
+                not isinstance(evidence_references, list)
+                or not evidence_references
+                or len(evidence_references) != len(set(map(str, evidence_references)))
+                or not all(
+                    isinstance(reference, str) and reference for reference in evidence_references
+                )
+            ):
+                raise ValueError("normalization parity disposition is invalid")
+            disposition_raw_ids[str(disposition_type)].add(raw_unit_id)
         promotion_by_raw_unit[raw_unit_id] = promotion
-    if (
-        set(promotion_by_raw_unit) != set(census_hashes)
-        or promoted_event_ids != event_ids
-    ):
+    if set(promotion_by_raw_unit) != set(census_hashes) or promoted_event_ids != event_ids:
         raise ValueError("normalization parity promotion crosswalk mismatch")
-    coverage_sources = _required_list(coverage, "sources")
-    denominator = coverage.get("denominator")
-    if (
-        not isinstance(denominator, Mapping)
-        or denominator.get("count") != len(census_hashes)
-        or not isinstance(denominator.get("manifest_hash"), str)
-        or not _DIGEST_PATTERN.fullmatch(str(denominator.get("manifest_hash")))
+    if not (disposition_raw_ids["blocked"] | disposition_raw_ids["unsupported"]) <= set(
+        parity_readiness["unresolved_blockers"],
     ):
-        raise ValueError("coverage receipt source denominator mismatch")
-    coverage_by_raw_unit: dict[str, Mapping[str, Any]] = {}
-    for item in coverage_sources:
-        if not isinstance(item, Mapping):
-            raise ValueError("coverage receipt source denominator mismatch")
-        source_id = _required_text(item, "source_id")
-        raw_unit_id = "raw_" + source_id.removeprefix("src_")
-        if raw_unit_id in coverage_by_raw_unit:
-            raise ValueError("coverage receipt source denominator mismatch")
-        coverage_by_raw_unit[raw_unit_id] = item
-    if set(coverage_by_raw_unit) != set(census_hashes):
-        # Compatibility with earlier ready fixtures where coverage classified
-        # one source envelope per one raw unit.
-        coverage_source_ids = {
-            str(item.get("source_id"))
-            for item in coverage_sources
-            if isinstance(item, Mapping)
-        }
-        if len(census_hashes) != len(envelope_ids) or coverage_source_ids != envelope_ids:
-            raise ValueError("coverage receipt source denominator mismatch")
-        coverage_by_raw_unit = {
-            raw_unit_id: item
-            for raw_unit_id, item in zip(
-                sorted(census_hashes),
-                sorted(
-                    coverage_sources,
-                    key=lambda source: str(source.get("source_id")),
-                ),
-                strict=True,
-            )
-        }
-    for raw_unit_id, item in coverage_by_raw_unit.items():
-        status = item.get("status")
-        accessible = item.get("accessible")
-        content_hash = census_hashes[raw_unit_id]
-        if content_hash is not None and (
-            status != "parsed" or accessible is not True
-        ):
-            raise ValueError("coverage receipt misclassifies an acquired source")
-        if content_hash is None and (
-            not allow_blocked or status == "parsed" or accessible is not False
-        ):
-            raise ValueError("coverage receipt contains a non-ready source")
+        raise ValueError("normalization parity blocker debt omits dispositions")
+    if not disposition_raw_ids["quarantined"] <= set(
+        parity_readiness["quarantines"],
+    ):
+        raise ValueError("normalization parity quarantine debt omits dispositions")
+    lineage_source_ids = {_required_text(node, "source_envelope_id") for node in graph["nodes"]} | {
+        _required_text(span, "source_envelope_id")
+        for edge in graph["edges"]
+        for span in edge["evidence_spans"]
+    }
+    if not lineage_source_ids <= envelope_ids:
+        raise ValueError(
+            "source envelopes do not cover the lineage-source denominator",
+        )
+    _validate_lineage_coverage(
+        coverage,
+        expected_source_ids=lineage_source_ids,
+    )
+    _validate_receipt_pair_debt(
+        coverage_readiness=coverage_readiness,
+        parity_readiness=parity_readiness,
+        parity_receipt_id=parity_receipt_id,
+    )
+    _validate_testament_constitutional_scope(testament, coverage)
 
     if not isinstance(assertion_evidence, list) or not assertion_evidence:
         raise ValueError("assertion evidence must be a non-empty list")

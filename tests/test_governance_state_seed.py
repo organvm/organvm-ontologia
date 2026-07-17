@@ -176,7 +176,7 @@ def _receipts(*, ready: bool = False) -> tuple[dict, dict]:
     parity_body = {
         "contract_name": "normalization-parity-receipt.v1",
         "contract_version": 1,
-        "receipt_id": "parity:fixture",
+        "receipt_id": "normalization-parity-fixture",
         "snapshot_id": SNAPSHOT,
         "snapshot_digest": SNAPSHOT_DIGEST,
         "generated_at": GENERATED_AT,
@@ -206,7 +206,10 @@ def _receipts(*, ready: bool = False) -> tuple[dict, dict]:
     }
     coverage_readiness = _readiness(ready=ready)
     if not ready:
-        coverage_readiness["unresolved_blockers"] = ["src_document"]
+        coverage_readiness["unresolved_blockers"] = [
+            "receipt:normalization-parity-fixture#/readiness/unresolved_blockers",
+            "src_document",
+        ]
     sources = []
     for source_id, _raw_unit_id, _character in source_units:
         source = {
@@ -245,7 +248,7 @@ def _receipts(*, ready: bool = False) -> tuple[dict, dict]:
         "denominator": {
             "discovery_manifest_reference": "manifest:fixture",
             "count": len(sources),
-            "manifest_hash": "sha256:" + "1" * 64,
+            "manifest_hash": content_digest(sources),
         },
         "sources": sources,
         "counts": {
@@ -255,6 +258,13 @@ def _receipts(*, ready: bool = False) -> tuple[dict, dict]:
             "inaccessible": 0,
             "missing_expected": 0,
             "owner_blocked": 0 if ready else 1,
+        },
+        "constitutional_scope": {
+            "scope_reference": "scope:fixture-lineage-sources",
+            "exact_all": True,
+            "blocked_scopes": [] if ready else ["src_document"],
+            "missing_requirements": [],
+            "ready": ready,
         },
         "exact_all": coverage_readiness["exact_all"],
         "ready": coverage_readiness["ready"],
@@ -270,6 +280,148 @@ def _receipts(*, ready: bool = False) -> tuple[dict, dict]:
             )
         },
         "residual_owners": residual_owners,
+    }
+    coverage = {
+        **coverage_body,
+        "receipt_hash": content_digest(coverage_body),
+    }
+    return coverage, parity
+
+
+def _lineage_with_31_sources() -> dict:
+    lineage = _lineage()
+    for index in range(4, 31):
+        lineage["nodes"].append(
+            _node(
+                f"artifact:extra-{index:02d}",
+                external_id="repository:beta",
+                source_id=f"src_extra_{index:02d}",
+                occurred_at=f"2026-07-16T19:10:{index:02d}Z",
+                lane="artifact",
+                node_type="document",
+                body_character="0123456789abcdef"[index % 16],
+            ),
+        )
+    return lineage
+
+
+def _independent_denominator_receipts() -> tuple[dict, dict]:
+    parity_id = "normalization-parity-independent-fixture"
+    raw_units = [
+        {
+            "raw_unit_id": f"raw_unit_{index:02d}",
+            "content_hash": f"sha256:{index + 1:064x}",
+        }
+        for index in range(17)
+    ]
+    event_ids_by_raw_unit = {raw_unit["raw_unit_id"]: [] for raw_unit in raw_units}
+    for index in range(31):
+        raw_unit_id = raw_units[index % len(raw_units)]["raw_unit_id"]
+        event_ids_by_raw_unit[raw_unit_id].append(f"evt_{index + 101:064x}")
+    promotions = [
+        {
+            "raw_unit_id": raw_unit["raw_unit_id"],
+            "raw_unit_content_hash": raw_unit["content_hash"],
+            "event_ids": event_ids_by_raw_unit[raw_unit["raw_unit_id"]],
+        }
+        for raw_unit in raw_units
+    ]
+    parity_body = {
+        "contract_name": "normalization-parity-receipt.v1",
+        "contract_version": 1,
+        "receipt_id": parity_id,
+        "snapshot_id": SNAPSHOT,
+        "snapshot_digest": SNAPSHOT_DIGEST,
+        "generated_at": GENERATED_AT,
+        "input_census": {
+            "census_id": "census:independent-fixture",
+            "census_reference": "source-census.v1.json",
+            "census_digest": "sha256:" + "9" * 64,
+            "raw_unit_ids": [raw_unit["raw_unit_id"] for raw_unit in raw_units],
+            "raw_units": raw_units,
+        },
+        "output_events": {
+            "event_set_reference": "normalized-events.v1.jsonl",
+            "event_set_digest": "sha256:" + "8" * 64,
+            "event_ids": sorted(
+                event_id for event_ids in event_ids_by_raw_unit.values() for event_id in event_ids
+            ),
+        },
+        "promotions": promotions,
+        "readiness": {
+            "exact_all": True,
+            "unresolved_blockers": ["blocker:official-browser-export"],
+            "quarantines": ["quarantine:adapter-diagnostic"],
+            "missing_requirements": [],
+            "citation_debt": [],
+            "incomplete_predicates": [],
+            "ready": False,
+            "status": "blocked",
+        },
+        "digest_algorithm": "sha256-rfc8785-excluding-self-digest-v1",
+    }
+    parity = {
+        **parity_body,
+        "receipt_digest": content_digest(parity_body),
+    }
+
+    lineage = _lineage_with_31_sources()
+    source_ids = sorted(
+        {node["source_envelope_id"] for node in lineage["nodes"]}
+        | {
+            span["source_envelope_id"]
+            for edge in lineage["edges"]
+            for span in edge["evidence_spans"]
+        },
+    )
+    sources = [
+        {
+            "source_id": source_id,
+            "status": "parsed",
+            "accessible": True,
+            "evidence_references": [f"source-envelope:{source_id}"],
+        }
+        for source_id in source_ids
+    ]
+    coverage_body = {
+        "contract_name": "coverage-receipt.v1",
+        "contract_version": 1,
+        "receipt_id": "coverage:independent-fixture",
+        "snapshot_id": SNAPSHOT,
+        "generated_at": GENERATED_AT,
+        "denominator": {
+            "discovery_manifest_reference": "coverage-receipt.v1.json#/sources",
+            "count": len(sources),
+            "manifest_hash": content_digest(sources),
+        },
+        "sources": sources,
+        "counts": {
+            "acquired": 0,
+            "parsed": len(sources),
+            "quarantined": 0,
+            "inaccessible": 0,
+            "missing_expected": 0,
+            "owner_blocked": 0,
+        },
+        "constitutional_scope": {
+            "scope_reference": "coverage-receipt.v1.json#/sources",
+            "exact_all": True,
+            "blocked_scopes": [],
+            "missing_requirements": [],
+            "ready": True,
+        },
+        "exact_all": True,
+        "ready": False,
+        "unresolved_blockers": [
+            "assertion:governance-candidate",
+            f"receipt:{parity_id}#/readiness/unresolved_blockers",
+        ],
+        "quarantines": [f"receipt:{parity_id}#/readiness/quarantines"],
+        "missing_requirements": ["ratified constitutional record"],
+        "citation_debt": ["assertion:governance-candidate"],
+        "incomplete_predicates": ["IF-GOV-001"],
+        "closure_status": "blocked",
+        "residual_owners": [],
     }
     coverage = {
         **coverage_body,
@@ -420,6 +572,146 @@ def test_seed_state_derives_pass_from_both_ready_receipts(tmp_path: Path) -> Non
         for node in ideal_nodes
         for receipt in node["metadata"]["predicate_receipts"]
     } == {"pass"}
+
+
+def test_seed_state_keeps_31_lineage_sources_distinct_from_17_raw_units(
+    tmp_path: Path,
+) -> None:
+    coverage, parity = _independent_denominator_receipts()
+    state_root, resolved, crosswalk = _paths(tmp_path)
+    result = seed_governance_state(
+        lineage_graph=_lineage_with_31_sources(),
+        coverage_receipt=coverage,
+        normalization_parity_receipt=parity,
+        seed=_seed(),
+        snapshot_id=SNAPSHOT,
+        snapshot_at=SNAPSHOT_AT,
+        state_root=state_root,
+        resolved_lineage_out=resolved,
+        crosswalk_out=crosswalk,
+    )
+    coverage_binding, parity_binding = result.crosswalk["receipt_bindings"]
+    assert coverage_binding == {
+        "contract_name": "coverage-receipt.v1",
+        "denominator_kind": "lineage_source_envelopes",
+        "denominator_count": 31,
+        "receipt_id": "coverage:independent-fixture",
+        "receipt_digest": coverage["receipt_hash"],
+        "reference": "receipt:coverage:independent-fixture",
+        "constitutional_scope_ready": True,
+        "ready": False,
+        "result": "blocked",
+    }
+    assert parity_binding == {
+        "contract_name": "normalization-parity-receipt.v1",
+        "denominator_kind": "normalization_raw_units",
+        "denominator_count": 17,
+        "output_event_count": 31,
+        "receipt_id": "normalization-parity-independent-fixture",
+        "receipt_digest": parity["receipt_digest"],
+        "snapshot_digest": SNAPSHOT_DIGEST,
+        "reference": "receipt:normalization-parity-independent-fixture",
+        "ready": False,
+        "result": "blocked",
+    }
+    assert result.crosswalk["counts"]["resolved_lineage_nodes"] == 31
+    assert max(len(promotion["event_ids"]) for promotion in parity["promotions"]) == 2
+    assert coverage["constitutional_scope"]["ready"] is True
+    assert result.crosswalk["receipt_bindings"][0]["ready"] is False
+
+    before = _tree_bytes(tmp_path)
+    replay = seed_governance_state(
+        lineage_graph=_lineage_with_31_sources(),
+        coverage_receipt=coverage,
+        normalization_parity_receipt=parity,
+        seed=_seed(),
+        snapshot_id=SNAPSHOT,
+        snapshot_at=SNAPSHOT_AT,
+        state_root=state_root,
+        resolved_lineage_out=resolved,
+        crosswalk_out=crosswalk,
+    )
+    assert replay.replayed is True
+    assert _tree_bytes(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("status", "accessible", "debt_field"),
+    [
+        ("acquired", True, "incomplete_predicates"),
+        ("quarantined", True, "quarantines"),
+        ("inaccessible", False, "unresolved_blockers"),
+        ("missing_expected", False, "missing_requirements"),
+        ("owner_blocked", False, "unresolved_blockers"),
+    ],
+)
+def test_seed_state_routes_each_nonparsed_status_without_denominator_conflation(
+    tmp_path: Path,
+    status: str,
+    accessible: bool,
+    debt_field: str,
+) -> None:
+    coverage, parity = _receipts(ready=True)
+    source = coverage["sources"][-1]
+    source.update(
+        {
+            "status": status,
+            "accessible": accessible,
+            "owner_reference": "owner:coverage",
+            "failed_predicate": "source envelope is parsed",
+            "next_action": "Resolve the source classification and rerun.",
+        },
+    )
+    coverage["counts"]["parsed"] = 3
+    coverage["counts"][status] = 1
+    for field_name in (
+        "unresolved_blockers",
+        "quarantines",
+        "missing_requirements",
+        "citation_debt",
+        "incomplete_predicates",
+    ):
+        coverage[field_name] = ["src_document"] if field_name == debt_field else []
+    coverage["constitutional_scope"].update(
+        {
+            "blocked_scopes": ["src_document"],
+            "ready": False,
+        },
+    )
+    coverage["ready"] = False
+    coverage["closure_status"] = "closed_with_owner_routed_debt"
+    coverage["residual_owners"] = [
+        {
+            "source_id": "src_document",
+            "owner_reference": "owner:coverage",
+            "failed_predicate": "source envelope is parsed",
+            "next_action": "Resolve the source classification and rerun.",
+        },
+    ]
+    coverage["denominator"]["manifest_hash"] = content_digest(
+        coverage["sources"],
+    )
+    coverage["receipt_hash"] = content_digest(
+        {key: value for key, value in coverage.items() if key != "receipt_hash"},
+    )
+    state_root, resolved, crosswalk = _paths(tmp_path)
+
+    result = seed_governance_state(
+        lineage_graph=_lineage(),
+        coverage_receipt=coverage,
+        normalization_parity_receipt=parity,
+        seed=_seed(),
+        snapshot_id=SNAPSHOT,
+        snapshot_at=SNAPSHOT_AT,
+        state_root=state_root,
+        resolved_lineage_out=resolved,
+        crosswalk_out=crosswalk,
+    )
+
+    binding = result.crosswalk["receipt_bindings"][0]
+    assert binding["denominator_count"] == 4
+    assert binding["constitutional_scope_ready"] is False
+    assert binding["ready"] is False
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
@@ -573,7 +865,7 @@ def test_seed_state_rejects_incomplete_receipts_and_uncovered_lineage(
 
     lineage = _lineage()
     lineage["nodes"][0]["source_envelope_id"] = "src_fabricated"
-    with pytest.raises(ValueError, match="absent from coverage"):
+    with pytest.raises(ValueError, match="does not exactly match coverage"):
         _seed_state(tmp_path / "uncovered-lineage", lineage=lineage)
 
 

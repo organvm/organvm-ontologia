@@ -89,6 +89,7 @@ _COVERAGE_KEYS = frozenset(
         "denominator",
         "sources",
         "counts",
+        "constitutional_scope",
         "exact_all",
         "ready",
         *_DEBT_FIELDS,
@@ -227,7 +228,9 @@ def _readiness(
     return {**normalized, "ready": ready, "status": str(status)}
 
 
-def _validate_coverage_receipt(value: Mapping[str, Any]) -> tuple[set[str], dict[str, int]]:
+def _validate_coverage_receipt(
+    value: Mapping[str, Any],
+) -> tuple[set[str], dict[str, int], dict[str, Any]]:
     _exact_keys(value, _COVERAGE_KEYS, label="coverage receipt")
     denominator = value.get("denominator")
     if not isinstance(denominator, Mapping):
@@ -292,6 +295,8 @@ def _validate_coverage_receipt(value: Mapping[str, Any]) -> tuple[set[str], dict
         or denominator_count != len(source_ids)
     ):
         raise ValueError("coverage denominator count does not equal classified sources")
+    if denominator.get("manifest_hash") != content_digest(sources):
+        raise ValueError("coverage manifest hash does not bind the source denominator")
 
     counts = value.get("counts")
     if not isinstance(counts, Mapping) or set(counts) != set(_COVERAGE_STATUSES):
@@ -327,13 +332,15 @@ def _validate_coverage_receipt(value: Mapping[str, Any]) -> tuple[set[str], dict
             if item["status"] == "acquired"
         ),
     }
+    normalized_debt = {
+        field_name: sorted(
+            _unique_text_list(value.get(field_name), label=f"coverage {field_name}"),
+        )
+        for field_name in _DEBT_FIELDS
+    }
     for field_name, expected in expected_debt.items():
-        if (
-            sorted(_unique_text_list(value.get(field_name), label=f"coverage {field_name}"))
-            != expected
-        ):
-            raise ValueError(f"coverage {field_name} does not match source classifications")
-    _unique_text_list(value.get("citation_debt"), label="coverage citation_debt")
+        if not set(expected) <= set(normalized_debt[field_name]):
+            raise ValueError(f"coverage {field_name} omits source-classification debt")
 
     residuals = value.get("residual_owners")
     if not isinstance(residuals, list):
@@ -362,18 +369,74 @@ def _validate_coverage_receipt(value: Mapping[str, Any]) -> tuple[set[str], dict
     ):
         raise ValueError("coverage residual owners do not exactly cover non-parsed sources")
 
+    constitutional_scope = value.get("constitutional_scope")
+    if not isinstance(constitutional_scope, Mapping):
+        raise ValueError("coverage constitutional_scope must be an object")
+    _exact_keys(
+        constitutional_scope,
+        frozenset(
+            {
+                "scope_reference",
+                "exact_all",
+                "blocked_scopes",
+                "missing_requirements",
+                "ready",
+            },
+        ),
+        label="coverage constitutional_scope",
+    )
+    _required_text(constitutional_scope, "scope_reference")
+    blocked_scopes = sorted(
+        _unique_text_list(
+            constitutional_scope.get("blocked_scopes"),
+            label="coverage constitutional blocked_scopes",
+        ),
+    )
+    scope_missing = sorted(
+        _unique_text_list(
+            constitutional_scope.get("missing_requirements"),
+            label="coverage constitutional missing_requirements",
+        ),
+    )
+    expected_blocked_scopes = sorted(
+        source_id
+        for source_id, item in zip(source_ids, sources, strict=True)
+        if item["status"] != "parsed"
+    )
     exact_all = value.get("exact_all")
     if exact_all is not True:
         raise ValueError("coverage receipt is not exact_all")
+    if (
+        constitutional_scope.get("exact_all") is not exact_all
+        or blocked_scopes != expected_blocked_scopes
+    ):
+        raise ValueError("coverage constitutional_scope contradicts classified sources")
+    if not set(scope_missing) <= set(normalized_debt["missing_requirements"]):
+        raise ValueError("coverage constitutional_scope debt is not owner-routed globally")
+    scope_ready = exact_all and not blocked_scopes and not scope_missing
+    if constitutional_scope.get("ready") is not scope_ready:
+        raise ValueError("coverage constitutional_scope ready is invalid")
     ready = value.get("ready")
     expected_ready = (
-        normalized_counts["parsed"] == len(source_ids)
+        exact_all
+        and normalized_counts["parsed"] == len(source_ids)
         and not residuals
-        and not any(value.get(field_name) for field_name in _DEBT_FIELDS)
+        and not any(normalized_debt[field_name] for field_name in _DEBT_FIELDS)
+        and scope_ready
     )
     if ready is not expected_ready:
         raise ValueError("coverage ready contradicts classified sources")
-    return set(source_ids), normalized_counts
+    return (
+        set(source_ids),
+        normalized_counts,
+        {
+            "scope_reference": str(constitutional_scope["scope_reference"]),
+            "exact_all": exact_all,
+            "blocked_scopes": blocked_scopes,
+            "missing_requirements": scope_missing,
+            "ready": scope_ready,
+        },
+    )
 
 
 def _validate_parity_receipt(
@@ -592,34 +655,17 @@ def _validate_receipts(
         "receipt_digest",
     ):
         raise ValueError("normalization parity receipt digest mismatch")
-    coverage_source_ids, coverage_counts = _validate_coverage_receipt(coverage)
-    raw_unit_ids, _event_ids, parity_counts = _validate_parity_receipt(
+    coverage_source_ids, _coverage_counts, constitutional_scope = _validate_coverage_receipt(
+        coverage,
+    )
+    raw_unit_ids, event_ids, _parity_counts = _validate_parity_receipt(
         normalization_parity,
     )
-    if len(coverage_source_ids) != len(raw_unit_ids):
-        raise ValueError("coverage and parity receipts use different denominators")
-    expected_coverage_counts = {
-        "parsed": parity_counts["parsed"],
-        "quarantined": parity_counts["quarantined"],
-        "acquired": parity_counts["unclassified"],
-        "blocked": parity_counts["blocked"],
-    }
-    if (
-        coverage_counts["parsed"] != expected_coverage_counts["parsed"]
-        or coverage_counts["quarantined"] != expected_coverage_counts["quarantined"]
-        or coverage_counts["acquired"] != expected_coverage_counts["acquired"]
-        or (
-            coverage_counts["inaccessible"]
-            + coverage_counts["missing_expected"]
-            + coverage_counts["owner_blocked"]
-        )
-        != expected_coverage_counts["blocked"]
-    ):
-        raise ValueError("coverage classifications do not match parity promotions")
-    unbound_sources = sorted(lineage_source_ids - coverage_source_ids)
-    if unbound_sources:
+    if lineage_source_ids != coverage_source_ids:
         raise ValueError(
-            f"lineage source envelopes are absent from coverage: {unbound_sources!r}",
+            "lineage source-envelope denominator does not exactly match coverage "
+            f"(missing={sorted(lineage_source_ids - coverage_source_ids)!r}, "
+            f"extra={sorted(coverage_source_ids - lineage_source_ids)!r})",
         )
 
     coverage_generated_at = _required_text(coverage, "generated_at")
@@ -650,17 +696,39 @@ def _validate_receipts(
     parity_id = _required_text(normalization_parity, "receipt_id")
     if coverage_id == parity_id:
         raise ValueError("coverage and parity receipts must have distinct IDs")
+    for field_name in _DEBT_FIELDS:
+        coverage_debt = set(coverage_readiness[field_name])
+        parity_reference = f"receipt:{parity_id}#/readiness/{field_name}"
+        stale_parity_references = {
+            reference
+            for reference in coverage_debt
+            if reference.startswith("receipt:normalization-parity-")
+            and reference.endswith(f"#/readiness/{field_name}")
+            and reference != parity_reference
+        }
+        if stale_parity_references:
+            raise ValueError(f"coverage {field_name} binds a stale parity receipt")
+        if bool(parity_readiness[field_name]) != (parity_reference in coverage_debt):
+            raise ValueError(
+                f"coverage {field_name} does not bind parity readiness debt",
+            )
     return (
         {
             "contract_name": "coverage-receipt.v1",
+            "denominator_kind": "lineage_source_envelopes",
+            "denominator_count": len(coverage_source_ids),
             "receipt_id": coverage_id,
             "receipt_digest": str(coverage["receipt_hash"]),
             "reference": f"receipt:{coverage_id}",
+            "constitutional_scope_ready": constitutional_scope["ready"],
             "ready": coverage_readiness["ready"],
             "result": "pass" if coverage_readiness["ready"] else "blocked",
         },
         {
             "contract_name": "normalization-parity-receipt.v1",
+            "denominator_kind": "normalization_raw_units",
+            "denominator_count": len(raw_unit_ids),
+            "output_event_count": len(event_ids),
             "receipt_id": parity_id,
             "receipt_digest": str(normalization_parity["receipt_digest"]),
             "snapshot_digest": snapshot_digest,

@@ -195,15 +195,25 @@
       "additionalProperties": false,
       "required": [
         "contract_name",
+        "denominator_kind",
+        "denominator_count",
         "receipt_id",
         "receipt_digest",
         "reference",
+        "constitutional_scope_ready",
         "ready",
         "result"
       ],
       "properties": {
         "contract_name": {
           "const": "coverage-receipt.v1"
+        },
+        "denominator_kind": {
+          "const": "lineage_source_envelopes"
+        },
+        "denominator_count": {
+          "type": "integer",
+          "minimum": 1
         },
         "receipt_id": {
           "type": "string",
@@ -215,6 +225,9 @@
         "reference": {
           "type": "string",
           "pattern": "^receipt:.+"
+        },
+        "constitutional_scope_ready": {
+          "type": "boolean"
         },
         "ready": {
           "type": "boolean"
@@ -233,6 +246,9 @@
       "additionalProperties": false,
       "required": [
         "contract_name",
+        "denominator_kind",
+        "denominator_count",
+        "output_event_count",
         "receipt_id",
         "receipt_digest",
         "snapshot_digest",
@@ -243,6 +259,17 @@
       "properties": {
         "contract_name": {
           "const": "normalization-parity-receipt.v1"
+        },
+        "denominator_kind": {
+          "const": "normalization_raw_units"
+        },
+        "denominator_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "output_event_count": {
+          "type": "integer",
+          "minimum": 0
         },
         "receipt_id": {
           "type": "string",

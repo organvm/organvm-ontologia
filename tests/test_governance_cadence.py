@@ -30,7 +30,6 @@ from tests.test_governance_memory import (
 )
 
 RAW_HASH = "sha256:" + "b" * 64
-BLOCKED_SOURCE_ID = "src_blocked_fixture"
 BLOCKED_RAW_UNIT_ID = "raw_blocked_fixture"
 
 
@@ -93,7 +92,7 @@ def _blocked_input_values(lineage_graph: dict) -> dict:
     )
     parity["readiness"].update(
         {
-            "unresolved_blockers": [BLOCKED_SOURCE_ID],
+            "unresolved_blockers": [BLOCKED_RAW_UNIT_ID],
             "quarantines": ["src_residual_fixture"],
             "ready": False,
             "status": "blocked",
@@ -104,31 +103,14 @@ def _blocked_input_values(lineage_graph: dict) -> dict:
     )
 
     coverage = deepcopy(ready.coverage_receipt)
-    coverage["denominator"]["count"] = 2
-    coverage["sources"][0]["source_id"] = "src_fixture_1"
-    coverage["sources"].append(
-        {
-            "source_id": BLOCKED_SOURCE_ID,
-            "status": "owner_blocked",
-            "accessible": False,
-            "owner_reference": "repo:fixture/owner",
-            "failed_predicate": "official export exists",
-            "next_action": "acquire the official read-only export",
-            "evidence_references": ["custody:expected-export"],
-        },
-    )
-    coverage["counts"]["owner_blocked"] = 1
-    coverage["unresolved_blockers"] = [BLOCKED_SOURCE_ID]
+    coverage["unresolved_blockers"] = [
+        "receipt:parity-fixture#/readiness/unresolved_blockers",
+    ]
+    coverage["quarantines"] = [
+        "receipt:parity-fixture#/readiness/quarantines",
+    ]
     coverage["ready"] = False
     coverage["closure_status"] = "closed_with_owner_routed_debt"
-    coverage["residual_owners"] = [
-        {
-            "source_id": BLOCKED_SOURCE_ID,
-            "owner_reference": "repo:fixture/owner",
-            "failed_predicate": "official export exists",
-            "next_action": "acquire the official read-only export",
-        },
-    ]
     coverage["receipt_hash"] = content_digest(
         {key: value for key, value in coverage.items() if key != "receipt_hash"},
     )
@@ -347,9 +329,10 @@ def test_allow_blocked_preserves_debt_and_real_evidence(tmp_path: Path) -> None:
     assert readiness["exact_all"] is True
     assert readiness["ready"] is False
     assert readiness["status"] == "closed_with_owner_routed_debt"
-    assert BLOCKED_SOURCE_ID in readiness["unresolved_blockers"]
+    assert BLOCKED_RAW_UNIT_ID in readiness["unresolved_blockers"]
     assert "src_residual_fixture" in readiness["quarantines"]
     assert "assertion:fixture" in readiness["citation_debt"]
+    assert inputs.coverage_receipt["constitutional_scope"]["ready"] is True
     image = result["node_self_image_set"]["self_images"][0]
     assert image["active_ideal_forms"][0]["implementation_state"] == "blocked"
     assert "receipt:parity-fixture" in image["evidence_references"]

@@ -95,21 +95,32 @@ def _pre_cadence_inputs(
     lineage_graph: dict,
     *,
     source_ids: tuple[str, ...] = ("src_event_1", "src_implementation"),
+    source_to_raw_unit: dict[str, str] | None = None,
+    coverage_source_ids: tuple[str, ...] | None = None,
 ):
+    if source_to_raw_unit is None:
+        source_to_raw_unit = {
+            source_id: f"raw_fixture_{index}" for index, source_id in enumerate(source_ids, start=1)
+        }
+    if set(source_to_raw_unit) != set(source_ids):
+        raise AssertionError("test source-to-raw mapping must exactly cover sources")
+    raw_unit_ids = tuple(
+        dict.fromkeys(source_to_raw_unit[source_id] for source_id in source_ids),
+    )
     raw_units = [
         {
-            "raw_unit_id": f"raw_fixture_{index}",
+            "raw_unit_id": raw_unit_id,
             "discovery_root_id": "root:fixture",
             "source_family": "fixture",
-            "source_instance": source_id,
+            "source_instance": raw_unit_id,
             "format_adapter": "fixture.v1",
             "native_identifiers": {"event_id": f"native:{index}"},
             "acquisition_status": "acquired",
             "content_hash": BODY_HASH,
-            "custody_pointer": f"private-cas://{source_id}",
-            "evidence_references": [f"source:{source_id}"],
+            "custody_pointer": f"private-cas://{raw_unit_id}",
+            "evidence_references": [f"raw-unit:{raw_unit_id}"],
         }
-        for index, source_id in enumerate(source_ids, start=1)
+        for index, raw_unit_id in enumerate(raw_unit_ids, start=1)
     ]
     census_body = {
         "contract_name": "source-census.v1",
@@ -144,7 +155,7 @@ def _pre_cadence_inputs(
             "source_family": "fixture",
             "source_instance": source_id,
             "format_adapter": "fixture.v1",
-            "raw_unit_id": raw_unit["raw_unit_id"],
+            "raw_unit_id": source_to_raw_unit[source_id],
             "raw_unit_content_hash": BODY_HASH,
             "custody_snapshot": {
                 "snapshot_id": SNAPSHOT,
@@ -156,28 +167,30 @@ def _pre_cadence_inputs(
             "authority_class": "operator_intent" if index == 1 else "artifact",
             "body_hash": BODY_HASH,
         }
-        for index, (source_id, raw_unit) in enumerate(
-            zip(source_ids, raw_units, strict=True),
-            start=1,
-        )
+        for index, source_id in enumerate(source_ids, start=1)
     ]
     events = [
         {
             "contract_name": "normalized-event.v1",
             "contract_version": 1,
-            "event_id": "evt_" + str(index) * 64,
+            "event_id": f"evt_{index:064x}",
             "snapshot_id": SNAPSHOT,
             "snapshot_digest": SNAPSHOT_DIGEST,
-            "raw_unit_id": raw_unit["raw_unit_id"],
+            "raw_unit_id": source_to_raw_unit[source_id],
             "raw_unit_content_hash": BODY_HASH,
             "identity_basis": {"content_hash": BODY_HASH},
             "source_envelope_reference": f"source:{source_id}",
         }
-        for index, (source_id, raw_unit) in enumerate(
-            zip(source_ids, raw_units, strict=True),
-            start=1,
-        )
+        for index, source_id in enumerate(source_ids, start=1)
     ]
+    events_by_raw_unit = {
+        raw_unit_id: [
+            event
+            for source_id, event in zip(source_ids, events, strict=True)
+            if source_to_raw_unit[source_id] == raw_unit_id
+        ]
+        for raw_unit_id in raw_unit_ids
+    }
     parity_body = {
         "contract_name": "normalization-parity-receipt.v1",
         "contract_version": 1,
@@ -207,9 +220,11 @@ def _pre_cadence_inputs(
             {
                 "raw_unit_id": raw_unit["raw_unit_id"],
                 "raw_unit_content_hash": BODY_HASH,
-                "event_ids": [event["event_id"]],
+                "event_ids": [
+                    event["event_id"] for event in events_by_raw_unit[raw_unit["raw_unit_id"]]
+                ],
             }
-            for raw_unit, event in zip(raw_units, events, strict=True)
+            for raw_unit in raw_units
         ],
         "readiness": {
             "exact_all": True,
@@ -227,6 +242,19 @@ def _pre_cadence_inputs(
         **parity_body,
         "receipt_digest": content_digest(parity_body),
     }
+    if coverage_source_ids is None:
+        coverage_source_ids = source_ids
+    if not set(coverage_source_ids) <= set(source_ids):
+        raise AssertionError("test coverage sources must come from source envelopes")
+    coverage_sources = [
+        {
+            "source_id": source_id,
+            "status": "parsed",
+            "accessible": True,
+            "evidence_references": [f"source:{source_id}"],
+        }
+        for source_id in coverage_source_ids
+    ]
     coverage_body = {
         "contract_name": "coverage-receipt.v1",
         "contract_version": 1,
@@ -235,25 +263,24 @@ def _pre_cadence_inputs(
         "generated_at": GENERATED,
         "denominator": {
             "discovery_manifest_reference": "manifest:fixture",
-            "count": len(envelopes),
-            "manifest_hash": "sha256:" + "d" * 64,
+            "count": len(coverage_sources),
+            "manifest_hash": content_digest(coverage_sources),
         },
-        "sources": [
-            {
-                "source_id": item["source_id"],
-                "status": "parsed",
-                "accessible": True,
-                "evidence_references": [f"source:{item['source_id']}"],
-            }
-            for item in envelopes
-        ],
+        "sources": coverage_sources,
         "counts": {
             "acquired": 0,
-            "parsed": len(envelopes),
+            "parsed": len(coverage_sources),
             "quarantined": 0,
             "inaccessible": 0,
             "missing_expected": 0,
             "owner_blocked": 0,
+        },
+        "constitutional_scope": {
+            "scope_reference": "manifest:fixture#/sources",
+            "exact_all": True,
+            "blocked_scopes": [],
+            "missing_requirements": [],
+            "ready": True,
         },
         "exact_all": True,
         "ready": True,
@@ -312,6 +339,315 @@ def _pre_cadence_inputs(
         normalization_parity_receipt=parity,
         coverage_receipt=coverage,
     )
+
+
+def _lineage_fixture(source_ids: tuple[str, ...]) -> dict:
+    return {
+        "contract_name": "lineage-graph.v1",
+        "contract_version": 1,
+        "graph_id": "lineage:independent-denominators",
+        "generated_at": GENERATED,
+        "frozen_snapshot_id": SNAPSHOT,
+        "nodes": [
+            {
+                "node_id": f"artifact:source-{index:02d}",
+                "lane": "operator_intent" if index == 0 else "artifact",
+                "node_type": "source_event",
+                "source_envelope_id": source_id,
+                "occurred_at": OBSERVED,
+                "authority_class": ("operator_intent" if index == 0 else "artifact"),
+                "summary": f"Reviewed source envelope {index}.",
+                "content_hash": BODY_HASH,
+                "review_state": "reviewed",
+            }
+            for index, source_id in enumerate(source_ids)
+        ],
+        "edges": [],
+    }
+
+
+def _rehash_coverage(coverage: dict) -> None:
+    sources = coverage["sources"]
+    coverage["denominator"]["count"] = len(sources)
+    coverage["denominator"]["manifest_hash"] = content_digest(sources)
+    coverage["counts"]["parsed"] = sum(source["status"] == "parsed" for source in sources)
+    body = {key: value for key, value in coverage.items() if key != "receipt_hash"}
+    coverage["receipt_hash"] = content_digest(body)
+
+
+def _rebuild_inputs(inputs, **overrides):
+    values = {
+        "lineage_graph": inputs.lineage_graph,
+        "governance_testament": inputs.governance_testament,
+        "source_census": inputs.source_census,
+        "source_envelopes": list(inputs.source_envelopes),
+        "normalized_events": list(inputs.normalized_events),
+        "assertion_evidence": list(inputs.assertion_evidence),
+        "normalization_parity_receipt": inputs.normalization_parity_receipt,
+        "coverage_receipt": inputs.coverage_receipt,
+    }
+    values.update(overrides)
+    return build_reconcile_inputs(
+        snapshot_id=inputs.snapshot_id,
+        snapshot_digest=inputs.snapshot_digest,
+        snapshot_at=inputs.snapshot_at,
+        **values,
+    )
+
+
+def test_pre_cadence_keeps_31_lineage_envelopes_distinct_from_17_raw_units() -> None:
+    source_ids = tuple(f"src_lineage_{index:02d}" for index in range(31))
+    source_to_raw_unit = {
+        source_id: f"raw_fixture_{index % 17:02d}" for index, source_id in enumerate(source_ids)
+    }
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(source_ids),
+        source_ids=source_ids,
+        source_to_raw_unit=source_to_raw_unit,
+    )
+
+    assert len(inputs.source_census["raw_units"]) == 17
+    assert len(inputs.normalized_events) == 31
+    assert len(inputs.source_envelopes) == 31
+    assert len(inputs.coverage_receipt["sources"]) == 31
+    assert len(inputs.normalization_parity_receipt["promotions"]) == 17
+    assert (
+        max(
+            len(promotion["event_ids"])
+            for promotion in inputs.normalization_parity_receipt["promotions"]
+        )
+        == 2
+    )
+
+
+def test_pre_cadence_allows_extra_cce_envelope_outside_lineage_coverage() -> None:
+    lineage_source_ids = ("src_event_1",)
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(lineage_source_ids),
+        source_ids=(*lineage_source_ids, "src_extra_cce"),
+        coverage_source_ids=lineage_source_ids,
+    )
+
+    assert len(inputs.source_envelopes) == 2
+    assert {source["source_id"] for source in inputs.coverage_receipt["sources"]} == set(
+        lineage_source_ids,
+    )
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_pre_cadence_rejects_rehashed_coverage_denominator_drift(
+    mutation: str,
+) -> None:
+    lineage_source_ids = tuple(f"src_lineage_{index:02d}" for index in range(31))
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(lineage_source_ids),
+        source_ids=(*lineage_source_ids, "src_extra_cce"),
+        coverage_source_ids=lineage_source_ids,
+    )
+    coverage = deepcopy(inputs.coverage_receipt)
+    if mutation == "missing":
+        coverage["sources"].pop()
+    else:
+        coverage["sources"].append(
+            {
+                "source_id": "src_extra_cce",
+                "status": "parsed",
+                "accessible": True,
+                "evidence_references": ["source:src_extra_cce"],
+            },
+        )
+    _rehash_coverage(coverage)
+
+    with pytest.raises(
+        ValueError,
+        match="does not exactly cover lineage source envelopes",
+    ):
+        _rebuild_inputs(inputs, coverage_receipt=coverage)
+
+
+def test_pre_cadence_rejects_coverage_manifest_hash_drift() -> None:
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(("src_event_1",)),
+        source_ids=("src_event_1",),
+    )
+    coverage = deepcopy(inputs.coverage_receipt)
+    coverage["denominator"]["manifest_hash"] = "sha256:" + "0" * 64
+    body = {key: value for key, value in coverage.items() if key != "receipt_hash"}
+    coverage["receipt_hash"] = content_digest(body)
+
+    with pytest.raises(ValueError, match="source denominator mismatch"):
+        _rebuild_inputs(inputs, coverage_receipt=coverage)
+
+
+def test_pre_cadence_rejects_false_ready_parity_disposition() -> None:
+    source_ids = ("src_event_1", "src_event_2")
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(source_ids),
+        source_ids=source_ids,
+    )
+    events = list(inputs.normalized_events)[1:]
+    parity = deepcopy(inputs.normalization_parity_receipt)
+    first_promotion = parity["promotions"][0]
+    first_promotion.pop("event_ids")
+    first_promotion["disposition"] = {
+        "type": "blocked",
+        "owner_reference": "owner:normalization",
+        "failed_predicate": "raw unit has normalized events",
+        "next_action": "Repair the adapter and rerun the snapshot.",
+        "evidence_references": ["raw-unit:raw_fixture_1"],
+    }
+    parity["output_events"]["event_ids"] = [event["event_id"] for event in events]
+    parity["receipt_digest"] = content_digest(
+        {key: value for key, value in parity.items() if key != "receipt_digest"},
+    )
+
+    with pytest.raises(ValueError, match="blocker debt omits dispositions"):
+        _rebuild_inputs(
+            inputs,
+            normalized_events=events,
+            normalization_parity_receipt=parity,
+            allow_blocked=True,
+        )
+
+
+def test_candidate_allows_global_debt_but_ratified_requires_ready_scope() -> None:
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(("src_event_1",)),
+        source_ids=("src_event_1",),
+    )
+    coverage = deepcopy(inputs.coverage_receipt)
+    coverage["constitutional_scope"].update(
+        {
+            "missing_requirements": ["requirement:authority-event"],
+            "ready": False,
+        },
+    )
+    coverage["missing_requirements"] = ["requirement:authority-event"]
+    coverage["ready"] = False
+    coverage["closure_status"] = "blocked"
+    _rehash_coverage(coverage)
+
+    candidate = _rebuild_inputs(
+        inputs,
+        coverage_receipt=coverage,
+        allow_blocked=True,
+    )
+    assert candidate.coverage_receipt["constitutional_scope"]["ready"] is False
+    assert candidate.readiness["ready"] is False
+
+    ratified = {
+        **inputs.governance_testament,
+        "status": "ratified",
+        "ratification": {
+            "constitutional_coverage": deepcopy(
+                coverage["constitutional_scope"],
+            ),
+        },
+    }
+    with pytest.raises(
+        ValueError,
+        match="ratified testament requires identical ready constitutional coverage",
+    ):
+        _rebuild_inputs(
+            inputs,
+            governance_testament=ratified,
+            coverage_receipt=coverage,
+            allow_blocked=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "accessible", "debt_field"),
+    [
+        ("acquired", True, "incomplete_predicates"),
+        ("quarantined", True, "quarantines"),
+        ("inaccessible", False, "unresolved_blockers"),
+        ("missing_expected", False, "missing_requirements"),
+        ("owner_blocked", False, "unresolved_blockers"),
+    ],
+)
+def test_reconcile_routes_each_nonparsed_lineage_source_status(
+    status: str,
+    accessible: bool,
+    debt_field: str,
+) -> None:
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(("src_event_1",)),
+        source_ids=("src_event_1",),
+    )
+    coverage = deepcopy(inputs.coverage_receipt)
+    coverage["sources"][0].update(
+        {
+            "status": status,
+            "accessible": accessible,
+            "owner_reference": "owner:coverage",
+            "failed_predicate": "lineage source envelope is parsed",
+            "next_action": "Resolve the source classification and rerun.",
+        },
+    )
+    coverage["counts"]["parsed"] = 0
+    coverage["counts"][status] = 1
+    for field_name in (
+        "unresolved_blockers",
+        "quarantines",
+        "missing_requirements",
+        "citation_debt",
+        "incomplete_predicates",
+    ):
+        coverage[field_name] = (
+            ["src_event_1"] if field_name == debt_field else []
+        )
+    coverage["constitutional_scope"].update(
+        {
+            "blocked_scopes": ["src_event_1"],
+            "ready": False,
+        },
+    )
+    coverage["ready"] = False
+    coverage["closure_status"] = "closed_with_owner_routed_debt"
+    coverage["residual_owners"] = [
+        {
+            "source_id": "src_event_1",
+            "owner_reference": "owner:coverage",
+            "failed_predicate": "lineage source envelope is parsed",
+            "next_action": "Resolve the source classification and rerun.",
+        },
+    ]
+    _rehash_coverage(coverage)
+
+    result = _rebuild_inputs(
+        inputs,
+        coverage_receipt=coverage,
+        allow_blocked=True,
+    )
+
+    assert result.coverage_receipt["constitutional_scope"]["ready"] is False
+    assert result.readiness["ready"] is False
+
+
+def test_reconcile_rejects_false_ready_constitutional_scope() -> None:
+    inputs = _pre_cadence_inputs(
+        _lineage_fixture(("src_event_1",)),
+        source_ids=("src_event_1",),
+    )
+    coverage = deepcopy(inputs.coverage_receipt)
+    coverage["constitutional_scope"]["missing_requirements"] = [
+        "requirement:authority-event",
+    ]
+    coverage["missing_requirements"] = ["requirement:authority-event"]
+    coverage["ready"] = False
+    coverage["closure_status"] = "blocked"
+    _rehash_coverage(coverage)
+
+    with pytest.raises(
+        ValueError,
+        match="constitutional_scope contradicts source coverage",
+    ):
+        _rebuild_inputs(
+            inputs,
+            coverage_receipt=coverage,
+            allow_blocked=True,
+        )
 
 
 def test_identical_text_preserves_authority_separation(store: RegistryStore) -> None:
@@ -1025,14 +1361,12 @@ def test_pre_cadence_interface_rejects_false_ready_owner_receipt() -> None:
     }
     inputs = _pre_cadence_inputs(graph, source_ids=("src_event_1",))
     coverage = deepcopy(inputs.coverage_receipt)
-    coverage["ready"] = False
-    coverage["closure_status"] = "closed_with_owner_routed_debt"
     coverage["unresolved_blockers"] = ["blocker:fixture"]
     coverage_body = dict(coverage)
     coverage_body.pop("receipt_hash")
     coverage["receipt_hash"] = content_digest(coverage_body)
 
-    with pytest.raises(ValueError, match="coverage receipt is not ready"):
+    with pytest.raises(ValueError, match="contradicts its declared debt"):
         build_reconcile_inputs(
             snapshot_id=inputs.snapshot_id,
             snapshot_digest=inputs.snapshot_digest,

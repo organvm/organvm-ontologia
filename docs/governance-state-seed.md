@@ -17,7 +17,7 @@ source bodies.
 ```bash
 ontologia governance seed-state \
   --lineage "$CORPVS_LINEAGE" \
-  --coverage "$CCE_COVERAGE_RECEIPT" \
+  --coverage "$CORPVS_COVERAGE_RECEIPT" \
   --normalization-parity "$CCE_PARITY_RECEIPT" \
   --seed "$PRIVATE/governance-state-seed.v1.json" \
   --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
@@ -59,12 +59,27 @@ Missing, extra, duplicate, already-resolved, or unsupported entity declarations
 fail before the state root is opened. Provider or source additions therefore
 change configuration rather than a hard-coded catalog or count.
 
-The CCE inputs are full final receipts, not header stubs. The command verifies
-their canonical digests, schemas' closed field sets, dynamic denominators,
-classification counts, residual-owner routing, complete raw-unit promotion
-crosswalk, event coverage, readiness debt, common snapshot and generation
-timestamp, and pairwise classification counts. Every source envelope used by
-the lineage (including edge evidence) must exist in the coverage denominator.
+The two owner receipts are full final receipts, not header stubs. CORPVS
+coverage classifies the exact lineage source-envelope denominator. CCE
+normalization parity independently classifies the raw-unit census and binds
+every raw unit to one or more normalized events or one explicit disposition.
+The two denominator counts therefore need not be equal: one raw unit may
+produce several source envelopes and normalized events.
+
+The command verifies canonical self-digests, closed field sets, dynamic
+denominators, classification counts, residual-owner routing, the complete
+raw-unit promotion crosswalk, event coverage, readiness debt, and the common
+snapshot and generation timestamp. Every lineage source envelope, including
+edge evidence, must appear exactly once in CORPVS coverage. Coverage may retain
+candidate, assertion, or exact-parity-receipt debt beyond debt derived from
+source statuses. A ready constitutional source scope does not make global
+coverage ready while any such debt remains.
+
+The emitted crosswalk labels the bindings separately as
+`lineage_source_envelopes` and `normalization_raw_units` and records both
+denominator counts plus the parity output-event count. These labels are part of
+the persisted replay identity; denominator conflation or receipt substitution
+fails closed.
 
 ## Exact mutation boundary
 

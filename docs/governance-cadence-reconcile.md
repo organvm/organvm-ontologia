@@ -37,6 +37,21 @@ classification, synthetic evidence, unresolved reviewed lineage, missing
 observations, missing ideal predicates, or a non-exact self-image denominator
 still fail.
 
+CORPVS coverage and CCE normalization parity remain distinct inputs throughout
+this stage. Coverage must equal the lineage source-envelope set exactly; parity
+must equal the source-census raw-unit set and promotion crosswalk exactly. CCE
+may contain additional valid normalized envelopes that CORPVS did not select
+for constitutional lineage. No count or provider-name correspondence is
+inferred between those denominators.
+
+Coverage source-derived debt is a required subset of global coverage debt, so
+candidate, assertion, and exact parity-receipt blockers remain visible. The
+separate `constitutional_scope.ready` value may be true while global
+`coverage.ready` remains false. A candidate testament may be materialized in
+that honest blocked state. A testament claiming `ratified` must instead bind
+an identical, exact, debt-free constitutional scope; blocked or missing
+constitutional coverage fails before registry mutation.
+
 ```bash
 ontologia-governance-cadence-reconcile \
   --snapshot-digest "$SNAPSHOT_DIGEST" \
