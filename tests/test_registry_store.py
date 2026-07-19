@@ -1,9 +1,11 @@
 """Tests for the unified registry store."""
 
+import json
 from pathlib import Path
 
 from ontologia.entity.identity import EntityType, LifecycleStatus
 from ontologia.events import bus
+from ontologia.metrics.metric import AggregationPolicy, MetricDefinition, MetricType
 from ontologia.registry.store import RegistryStore, open_store
 
 
@@ -180,3 +182,132 @@ class TestOpenStore:
         assert store.entity_count == 0
         store.create_entity(EntityType.REPO, display_name="test")
         assert store.entity_count == 1
+
+
+def test_open_store_uses_default_directory(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    monkeypatch.setattr("ontologia.registry.store.Path.home", lambda: home)
+
+    store = open_store()
+    assert store.store_dir == home / ".organvm" / "ontologia"
+
+    store.create_entity(EntityType.REPO, display_name="default-root")
+    store.save()
+    assert store.entities_path.is_file()
+
+
+def test_save_names_rebuilds_name_history(store: RegistryStore):
+    first = store.create_entity(EntityType.REPO, display_name="repo-alpha")
+    second = store.create_entity(EntityType.REPO, display_name="repo-beta")
+    store.rename_entity(first.uid, "repo-alpha-renamed")
+    store.add_alias(first.uid, "repo-alpha-aka")
+
+    store.save_names()
+    lines = [line for line in store.names_path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 4  # repo-alpha, rename, alias, repo-beta
+
+    parsed = [json.loads(line) for line in lines]
+    parsed_ids = {record["entity_id"] for record in parsed}
+    assert parsed_ids == {first.uid, second.uid}
+
+    reopened = RegistryStore(store_dir=store.store_dir)
+    reopened.load()
+    assert len(reopened.name_history(first.uid)) == 3
+    assert reopened.current_name(first.uid).display_name == "repo-alpha-renamed"
+    assert len(reopened.name_history(second.uid)) == 1
+
+
+def test_list_metrics(store: RegistryStore):
+    store.register_metric(
+        MetricDefinition(
+            metric_id="met_test_count",
+            name="Test Count",
+            metric_type=MetricType.GAUGE,
+            aggregation=AggregationPolicy.SUM,
+        ),
+    )
+    store.register_metric(
+        MetricDefinition(
+            metric_id="met_repo_size",
+            name="Repo Size",
+            metric_type=MetricType.COUNTER,
+            aggregation=AggregationPolicy.MAX,
+        ),
+    )
+
+    metric_ids = {metric.metric_id for metric in store.list_metrics()}
+    assert metric_ids == {"met_test_count", "met_repo_size"}
+
+    store.save()
+    reopened = RegistryStore(store_dir=store.store_dir)
+    reopened.load()
+    reopened_ids = {metric.metric_id for metric in reopened.list_metrics()}
+    assert reopened_ids == metric_ids
+
+
+def test_load_ignores_corrupt_persistence_records(store_dir: Path):
+    # Files contain a mix of valid and malformed rows.
+    (store_dir / "entities.json").write_text("{}")
+    (store_dir / "names.jsonl").write_text(
+        json.dumps(
+            {
+                "entity_id": "ent_repo_alpha",
+                "display_name": "Repo Alpha",
+                "slug": "repo-alpha",
+                "valid_from": "2026-01-01T00:00:00+00:00",
+                "is_primary": True,
+            },
+        )
+        + "\n"
+        + "{invalid-name-record}\n",
+    )
+    (store_dir / "edges.jsonl").write_text(
+        json.dumps(
+            {
+                "edge_type": "relation",
+                "source_id": "ent_src",
+                "target_id": "ent_tgt",
+                "relation_type": "depends_on",
+                "valid_from": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        + "\n"
+        + "{invalid-edge-record}\n",
+    )
+    (store_dir / "lineage.jsonl").write_text(
+        json.dumps(
+            {
+                "entity_id": "ent_repo_child",
+                "related_id": "ent_repo_parent",
+                "lineage_type": "derived_from",
+                "recorded_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        + "\n"
+        + "{invalid-lineage-record}\n",
+    )
+    (store_dir / "variables.json").write_text('{"vars": [')
+    (store_dir / "metrics.json").write_text('{"metrics": [')
+    (store_dir / "observations.jsonl").write_text(
+        "not-json-line\n"
+        + json.dumps(
+            {
+                "metric_id": "met_telemetry",
+                "entity_id": "ent_repo_alpha",
+                "value": 12.5,
+                "timestamp": "2026-01-01T00:00:00+00:00",
+                "source": "system",
+            },
+        ),
+    )
+
+    store = RegistryStore(store_dir=store_dir)
+    store.load()
+
+    assert store.current_name("ent_repo_alpha") is not None
+    assert len(store.edge_index.all_relation_edges()) == 1
+    predecessors = store.lineage_index.predecessors("ent_repo_child")
+    assert len(predecessors) == 1
+    assert predecessors[0].related_id == "ent_repo_parent"
+    assert store.observation_store.latest("met_telemetry", "ent_repo_alpha") is not None
+    assert store.get_metric("met_telemetry") is None
