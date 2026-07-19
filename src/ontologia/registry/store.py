@@ -22,6 +22,16 @@ from ontologia.entity.lineage import LineageIndex, LineageRecord, LineageType
 from ontologia.entity.naming import NameIndex, NameRecord, add_name
 from ontologia.entity.resolver import EntityResolver
 from ontologia.events import bus
+from ontologia.governance.memory import (
+    AuthorityEdge,
+    AuthorityGraphIndex,
+    AuthorityNode,
+    NodeSelfImage,
+    QuarantineDiagnostic,
+    canonical_json,
+    content_digest,
+    evidence_refs,
+)
 from ontologia.metrics.metric import MetricDefinition
 from ontologia.metrics.observations import Observation, ObservationStore
 from ontologia.structure.edges import EdgeIndex, HierarchyEdge, RelationEdge, _now_iso
@@ -49,6 +59,8 @@ class RegistryStore:
     _name_index: NameIndex = field(default_factory=NameIndex)
     _edge_index: EdgeIndex = field(default_factory=EdgeIndex)
     _lineage_index: LineageIndex = field(default_factory=LineageIndex)
+    _authority_graph: AuthorityGraphIndex = field(default_factory=AuthorityGraphIndex)
+    _quarantine: dict[str, QuarantineDiagnostic] = field(default_factory=dict)
     _variable_store: VariableStore = field(default_factory=VariableStore)
     _observation_store: ObservationStore | None = field(default=None)
     _metrics: dict[str, MetricDefinition] = field(default_factory=dict)
@@ -90,6 +102,18 @@ class RegistryStore:
     def metrics_path(self) -> Path:
         return self.store_dir / "metrics.json"
 
+    @property
+    def authority_nodes_path(self) -> Path:
+        return self.store_dir / "governance-nodes.jsonl"
+
+    @property
+    def authority_edges_path(self) -> Path:
+        return self.store_dir / "governance-edges.jsonl"
+
+    @property
+    def quarantine_path(self) -> Path:
+        return self.store_dir / "quarantine.jsonl"
+
     # ------------------------------------------------------------------
     # Load / Save
     # ------------------------------------------------------------------
@@ -97,32 +121,58 @@ class RegistryStore:
     def load(self) -> None:
         """Load entities from JSON and names from JSONL."""
         self.store_dir.mkdir(parents=True, exist_ok=True)
+        self._load_quarantine()
 
         # Load entities
         self._entities.clear()
         if self.entities_path.is_file():
-            data = json.loads(self.entities_path.read_text())
-            for uid, edict in data.items():
-                self._entities[uid] = EntityIdentity.from_dict(edict)
+            raw = self.entities_path.read_text()
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("entities.json must contain an object")
+                for uid, edict in data.items():
+                    try:
+                        self._entities[uid] = EntityIdentity.from_dict(edict)
+                    except (KeyError, TypeError, ValueError) as error:
+                        self._record_quarantine(
+                            f"{self.entities_path.name}:{uid}",
+                            json.dumps(edict, sort_keys=True),
+                            error,
+                        )
+            except (json.JSONDecodeError, TypeError, ValueError) as error:
+                self._record_quarantine(self.entities_path.name, raw, error)
 
         # Load names
         self._name_index = NameIndex()
         if self.names_path.is_file():
-            for line in self.names_path.read_text().splitlines():
-                line = line.strip()
+            for line_number, raw_line in enumerate(
+                self.names_path.read_text().splitlines(),
+                start=1,
+            ):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     record = NameRecord.from_dict(json.loads(line))
                     self._name_index.add(record)
-                except (json.JSONDecodeError, KeyError):
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    self._record_quarantine(
+                        self.names_path.name,
+                        raw_line,
+                        error,
+                        line_number,
+                    )
                     continue
 
         # Load edges
         self._edge_index = EdgeIndex()
         if self.edges_path.is_file():
-            for line in self.edges_path.read_text().splitlines():
-                line = line.strip()
+            for line_number, raw_line in enumerate(
+                self.edges_path.read_text().splitlines(),
+                start=1,
+            ):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
@@ -132,43 +182,76 @@ class RegistryStore:
                         self._edge_index.add_hierarchy(HierarchyEdge.from_dict(data))
                     elif edge_type == "relation":
                         self._edge_index.add_relation(RelationEdge.from_dict(data))
-                except (json.JSONDecodeError, KeyError):
+                    else:
+                        raise ValueError(f"unknown edge_type: {edge_type}")
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    self._record_quarantine(
+                        self.edges_path.name,
+                        raw_line,
+                        error,
+                        line_number,
+                    )
                     continue
 
         # Load lineage
         self._lineage_index = LineageIndex()
         if self.lineage_path.is_file():
-            for line in self.lineage_path.read_text().splitlines():
-                line = line.strip()
+            for line_number, raw_line in enumerate(
+                self.lineage_path.read_text().splitlines(),
+                start=1,
+            ):
+                line = raw_line.strip()
                 if not line:
                     continue
                 try:
                     self._lineage_index.add(LineageRecord.from_dict(json.loads(line)))
-                except (json.JSONDecodeError, KeyError, ValueError):
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                    self._record_quarantine(
+                        self.lineage_path.name,
+                        raw_line,
+                        error,
+                        line_number,
+                    )
                     continue
+
+        # Load the authority-qualified graph after the legacy lineage index.
+        # The two formats intentionally coexist: legacy callers keep their
+        # four lineage types while governance memory gets richer semantics.
+        self._authority_graph = AuthorityGraphIndex()
+        self._load_authority_nodes()
+        self._load_authority_edges()
 
         # Load variables
         self._variable_store = VariableStore()
         if self.variables_path.is_file():
+            raw = self.variables_path.read_text()
             try:
-                data = json.loads(self.variables_path.read_text())
+                data = json.loads(raw)
                 self._variable_store = VariableStore.from_list(data)
-            except (json.JSONDecodeError, KeyError):
-                pass
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                self._record_quarantine(self.variables_path.name, raw, error)
 
         # Load metrics definitions
         self._metrics = {}
         if self.metrics_path.is_file():
+            raw = self.metrics_path.read_text()
             try:
-                data = json.loads(self.metrics_path.read_text())
+                data = json.loads(raw)
                 for mid, mdict in data.items():
                     self._metrics[mid] = MetricDefinition.from_dict(mdict)
-            except (json.JSONDecodeError, KeyError):
-                pass
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                self._record_quarantine(self.metrics_path.name, raw, error)
 
         # Load observation store
         self._observation_store = ObservationStore(self.observations_path)
-        self._observation_store.load()
+        self._observation_store.load(
+            lambda line_number, raw_line, error: self._record_quarantine(
+                self.observations_path.name,
+                raw_line,
+                error,
+                line_number,
+            ),
+        )
 
         # Point the event bus at our events file
         bus.set_events_path(self.events_path)
@@ -226,6 +309,7 @@ class RegistryStore:
         created_by: str = "system",
         metadata: dict[str, Any] | None = None,
         timestamp_ms: int | None = None,
+        created_at: str | None = None,
     ) -> EntityIdentity:
         """Create a new entity with identity and initial name.
 
@@ -235,6 +319,7 @@ class RegistryStore:
             created_by: Creator identifier.
             metadata: Optional metadata dict.
             timestamp_ms: Optional deterministic timestamp for UID.
+            created_at: Optional explicit creation and initial-name timestamp.
 
         Returns:
             The new EntityIdentity.
@@ -244,6 +329,7 @@ class RegistryStore:
             created_by=created_by,
             metadata=metadata,
             timestamp_ms=timestamp_ms,
+            created_at=created_at,
         )
         self._entities[entity.uid] = entity
         self._dirty = True
@@ -255,6 +341,7 @@ class RegistryStore:
             display_name,
             is_primary=True,
             source=created_by,
+            valid_from=created_at,
         )
         self._append_name(name_record)
 
@@ -425,6 +512,12 @@ class RegistryStore:
             subject_entity=subject_entity,
             limit=limit,
             path=self.events_path,
+            on_error=lambda line_number, raw_line, error: self._record_quarantine(
+                self.events_path.name,
+                raw_line,
+                error,
+                line_number,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -575,6 +668,347 @@ class RegistryStore:
             f.write(json.dumps(record.to_dict(), separators=(",", ":")) + "\n")
 
     # ------------------------------------------------------------------
+    # Authority-qualified governance memory
+    # ------------------------------------------------------------------
+
+    @property
+    def authority_graph(self) -> AuthorityGraphIndex:
+        """The dual-lane, evidence-backed governance memory graph."""
+        return self._authority_graph
+
+    def add_authority_node(self, node: AuthorityNode) -> AuthorityNode:
+        """Persist an authority node idempotently."""
+        if not self._authority_graph.add_node(node):
+            return node
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        with self.authority_nodes_path.open("a") as file:
+            file.write(json.dumps(node.to_dict(), sort_keys=True, separators=(",", ":")) + "\n")
+        bus.emit(
+            "governance.node_recorded",
+            source="ontologia.governance",
+            subject_entity=node.entity_id,
+            payload={
+                "node_id": node.node_id,
+                "lane": node.lane.value,
+                "authority_class": node.authority_class.value,
+                "body_hash": node.body_hash,
+            },
+        )
+        return node
+
+    def add_authority_edge(self, edge: AuthorityEdge) -> AuthorityEdge:
+        """Persist a reviewed authority edge idempotently."""
+        if not self._authority_graph.add_edge(edge):
+            return edge
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        with self.authority_edges_path.open("a") as file:
+            file.write(json.dumps(edge.to_dict(), sort_keys=True, separators=(",", ":")) + "\n")
+        bus.emit(
+            "governance.edge_recorded",
+            source="ontologia.governance",
+            payload={
+                "edge_id": edge.edge_id,
+                "source_node_id": edge.source_node_id,
+                "target_node_id": edge.target_node_id,
+                "edge_type": edge.edge_type.value,
+                "review_state": edge.review_state.value,
+            },
+        )
+        return edge
+
+    @property
+    def quarantine_diagnostics(self) -> list[QuarantineDiagnostic]:
+        """Return hashed diagnostics without exposing malformed source bodies."""
+        return [self._quarantine[key] for key in sorted(self._quarantine)]
+
+    def node_self_image(
+        self,
+        entity_id: str,
+        *,
+        constitutional_digest: str,
+        last_reconciled_at: str,
+        allowed_evidence_references: frozenset[str],
+    ) -> NodeSelfImage:
+        """Project one deterministic self-image from registry-owned evidence."""
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            raise KeyError(f"unknown entity: {entity_id}")
+        if not constitutional_digest or not last_reconciled_at:
+            raise ValueError("self-image requires constitutional digest and reconciliation time")
+
+        def evidence_is_allowed(reference: str) -> bool:
+            return reference in allowed_evidence_references
+
+        def checked_evidence(
+            references: list[str],
+            *,
+            location: str,
+        ) -> list[str]:
+            normalized = sorted({str(reference) for reference in references if reference})
+            if (
+                not normalized
+                or not all(evidence_is_allowed(reference) for reference in normalized)
+            ):
+                raise ValueError(
+                    f"{location} lacks snapshot-bound evidence references",
+                )
+            return normalized
+
+        def relation_evidence(payload: dict[str, Any]) -> list[str]:
+            metadata = payload.get("metadata", {})
+            configured = metadata.get("evidence_references", [])
+            if isinstance(configured, list) and configured:
+                return checked_evidence(
+                    [str(reference) for reference in configured],
+                    location="registry relation",
+                )
+            raise ValueError(
+                "registry relation lacks snapshot-bound evidence references",
+            )
+
+        parent = self._edge_index.parent(entity_id, at=last_reconciled_at)
+        incoming: list[dict[str, Any]] = []
+        outgoing: list[dict[str, Any]] = []
+        if parent is not None:
+            payload = parent.to_dict()
+            incoming.append(
+                {
+                    "relation_type": "member_of",
+                    "target_node_id": parent.parent_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.children(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            outgoing.append(
+                {
+                    "relation_type": "contains",
+                    "target_node_id": edge.child_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.incoming_relations(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            incoming.append(
+                {
+                    "relation_type": edge.relation_type,
+                    "target_node_id": edge.source_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+        for edge in self._edge_index.outgoing_relations(entity_id, at=last_reconciled_at):
+            payload = edge.to_dict()
+            outgoing.append(
+                {
+                    "relation_type": edge.relation_type,
+                    "target_node_id": edge.target_id,
+                    "evidence_references": relation_evidence(payload),
+                },
+            )
+
+        linked_nodes = self._authority_graph.nodes_for_entity(entity_id)
+        linked_node_ids = {node.node_id for node in linked_nodes}
+        for edge in self._authority_graph.edges():
+            references = checked_evidence(
+                sorted({span.source_id for span in edge.evidence}),
+                location=f"governance relation {edge.edge_id}",
+            )
+            if edge.target_node_id in linked_node_ids:
+                incoming.append(
+                    {
+                        "relation_type": edge.edge_type.value,
+                        "target_node_id": edge.source_node_id,
+                        "evidence_references": references,
+                    },
+                )
+            if edge.source_node_id in linked_node_ids:
+                outgoing.append(
+                    {
+                        "relation_type": edge.edge_type.value,
+                        "target_node_id": edge.target_node_id,
+                        "evidence_references": references,
+                    },
+                )
+
+        incoming.sort(key=canonical_json)
+        outgoing.sort(key=canonical_json)
+        relations = {"incoming": incoming, "outgoing": outgoing}
+
+        latest_node = linked_nodes[-1] if linked_nodes else None
+        memory_cursor = f"memory:{latest_node.node_id}" if latest_node else None
+
+        entity_events = self.events(subject_entity=entity_id, limit=100_000)
+        latest_event = entity_events[-1] if entity_events else None
+        event_cursor = (
+            f"event:{content_digest(latest_event.to_dict())}" if latest_event else None
+        )
+
+        latest_observations: dict[str, Observation] = {}
+        for observation in self.observation_store.query(entity_id=entity_id):
+            current = latest_observations.get(observation.metric_id)
+            if current is None or (observation.timestamp, observation.source) > (
+                current.timestamp,
+                current.source,
+            ):
+                latest_observations[observation.metric_id] = observation
+        observations: list[dict[str, Any]] = []
+        for metric_id in sorted(latest_observations):
+            observation = latest_observations[metric_id]
+            configured = observation.metadata.get("evidence_references", [])
+            references = (
+                sorted({str(reference) for reference in configured})
+                if isinstance(configured, list) and configured
+                else []
+            )
+            references = checked_evidence(
+                references,
+                location=f"observation {observation.metric_id}",
+            )
+            observations.append(
+                {
+                    "key": observation.metric_id,
+                    "value": observation.value,
+                    "observed_at": observation.timestamp or last_reconciled_at,
+                    "evidence_references": references,
+                },
+            )
+
+        ideals: list[dict[str, Any]] = []
+        for node in linked_nodes:
+            ideal_form_id = node.metadata.get("ideal_form_id")
+            if ideal_form_id is None or node.metadata.get("active", True) is False:
+                continue
+            receipts = node.metadata.get("predicate_receipts")
+            if not isinstance(receipts, list) or not receipts:
+                raise ValueError(
+                    f"active ideal form {ideal_form_id} lacks predicate receipts",
+                )
+            predicate_ids: list[str] = []
+            receipt_references: set[str] = set()
+            passed = 0
+            blocked = False
+            for receipt in receipts:
+                if not isinstance(receipt, dict):
+                    raise ValueError(
+                        f"active ideal form {ideal_form_id} has an invalid predicate receipt",
+                    )
+                predicate_id = receipt.get("predicate_id")
+                receipt_reference = receipt.get("receipt_reference")
+                result = receipt.get("result")
+                if (
+                    not isinstance(predicate_id, str)
+                    or not predicate_id
+                    or not isinstance(receipt_reference, str)
+                    or not receipt_reference
+                    or result not in {"pass", "fail", "blocked"}
+                ):
+                    raise ValueError(
+                        f"active ideal form {ideal_form_id} has an invalid predicate receipt",
+                    )
+                predicate_ids.append(predicate_id)
+                receipt_references.add(receipt_reference)
+                passed += result == "pass"
+                blocked = blocked or result == "blocked"
+            total = len(receipts)
+            distance = (total - passed) / total
+            if blocked:
+                implementation_state = "blocked"
+            elif passed == total:
+                implementation_state = "verified"
+            elif passed:
+                implementation_state = "partial"
+            else:
+                implementation_state = "not_started"
+            ideal_evidence = checked_evidence(
+                sorted(
+                    {span.source_id for span in node.evidence}
+                    | receipt_references,
+                ),
+                location=f"active ideal form {ideal_form_id}",
+            )
+            ideals.append(
+                {
+                    "form_id": str(ideal_form_id),
+                    "implementation_state": implementation_state,
+                    "distance_to_ideal": distance,
+                    "predicate_references": sorted(predicate_ids),
+                    "evidence_references": ideal_evidence,
+                },
+            )
+        ideals.sort(key=canonical_json)
+
+        current_name = self.current_name(entity_id, at=last_reconciled_at)
+        owner = str(entity.metadata.get("owner", entity.created_by))
+        entity_type_map = {
+            EntityType.ORGAN: "organ",
+            EntityType.REPO: "repository",
+            EntityType.MODULE: "module",
+            EntityType.DOCUMENT: "document",
+            EntityType.SESSION: "session",
+            EntityType.VARIABLE: "artifact",
+            EntityType.METRIC: "artifact",
+        }
+        source_references = sorted(
+            {span.source_id for node in linked_nodes for span in node.evidence},
+        )
+        if not source_references:
+            raise ValueError(
+                f"registered node {entity_id} lacks snapshot-bound source evidence",
+            )
+        source_references = checked_evidence(
+            source_references,
+            location=f"registered node {entity_id}",
+        )
+
+        return NodeSelfImage(
+            node_id=entity_id,
+            node_type=entity_type_map[entity.entity_type],
+            display_name=current_name.display_name if current_name else None,
+            owner_reference=owner,
+            relations=relations,
+            cursors={"memory": memory_cursor, "event": event_cursor},
+            digests={
+                "constitutional": constitutional_digest,
+                "topology": content_digest(relations),
+            },
+            observations=observations,
+            active_ideal_forms=ideals,
+            reconciled_at=last_reconciled_at,
+            evidence_references=source_references,
+        )
+
+    def trace_state_value(self, entity_id: str, field_name: str) -> dict[str, Any]:
+        """Trace a current entity state value through events and source evidence."""
+        entity = self._entities.get(entity_id)
+        if entity is None:
+            raise KeyError(f"unknown entity: {entity_id}")
+        if field_name == "lifecycle_status":
+            value: Any = entity.lifecycle_status.value
+        elif field_name == "display_name":
+            name = self.current_name(entity_id)
+            value = name.display_name if name else None
+        elif field_name.startswith("metadata."):
+            value = entity.metadata.get(field_name.removeprefix("metadata."))
+        else:
+            raise ValueError(f"unsupported state field: {field_name}")
+
+        events = [
+            event.to_dict()
+            for event in self.events(subject_entity=entity_id, limit=100_000)
+            if event.changed_property == field_name
+            or event.event_type == bus.ENTITY_CREATED
+            or (field_name == "display_name" and event.event_type == bus.ENTITY_RENAMED)
+        ]
+        trace = {
+            "entity_id": entity_id,
+            "field": field_name,
+            "value": value,
+            "events": events,
+            "evidence_refs": evidence_refs(self._authority_graph.nodes_for_entity(entity_id)),
+        }
+        return {**trace, "trace_digest": content_digest(trace)}
+
+    # ------------------------------------------------------------------
     # Metric + Observation operations
     # ------------------------------------------------------------------
 
@@ -604,13 +1038,97 @@ class RegistryStore:
         entity_id: str,
         value: float,
         source: str = "system",
+        metadata: dict[str, Any] | None = None,
+        timestamp: str | None = None,
     ) -> Observation:
         """Record a metric observation (persisted immediately to JSONL)."""
-        return self.observation_store.observe(metric_id, entity_id, value, source)
+        return self.observation_store.observe(
+            metric_id,
+            entity_id,
+            value,
+            source,
+            metadata,
+            timestamp,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _load_authority_nodes(self) -> None:
+        if not self.authority_nodes_path.is_file():
+            return
+        for line_number, raw_line in enumerate(
+            self.authority_nodes_path.read_text().splitlines(),
+            start=1,
+        ):
+            if not raw_line.strip():
+                continue
+            try:
+                self._authority_graph.add_node(AuthorityNode.from_dict(json.loads(raw_line)))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                self._record_quarantine(
+                    self.authority_nodes_path.name,
+                    raw_line,
+                    error,
+                    line_number,
+                )
+
+    def _load_authority_edges(self) -> None:
+        if not self.authority_edges_path.is_file():
+            return
+        for line_number, raw_line in enumerate(
+            self.authority_edges_path.read_text().splitlines(),
+            start=1,
+        ):
+            if not raw_line.strip():
+                continue
+            try:
+                self._authority_graph.add_edge(AuthorityEdge.from_dict(json.loads(raw_line)))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                self._record_quarantine(
+                    self.authority_edges_path.name,
+                    raw_line,
+                    error,
+                    line_number,
+                )
+
+    def _load_quarantine(self) -> None:
+        self._quarantine = {}
+        if not self.quarantine_path.is_file():
+            return
+        for raw_line in self.quarantine_path.read_text().splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                diagnostic = QuarantineDiagnostic.from_dict(json.loads(raw_line))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                # A corrupt diagnostic cannot safely diagnose itself. Keep
+                # loading other records without exposing the raw body.
+                continue
+            self._quarantine[diagnostic.diagnostic_id] = diagnostic
+
+    def _record_quarantine(
+        self,
+        source_path: str,
+        raw_record: str,
+        error: Exception,
+        line_number: int | None = None,
+    ) -> None:
+        diagnostic = QuarantineDiagnostic.from_failure(
+            source_path=source_path,
+            raw_record=raw_record,
+            error=error,
+            line_number=line_number,
+        )
+        if diagnostic.diagnostic_id in self._quarantine:
+            return
+        self._quarantine[diagnostic.diagnostic_id] = diagnostic
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        with self.quarantine_path.open("a") as file:
+            file.write(
+                json.dumps(diagnostic.to_dict(), sort_keys=True, separators=(",", ":")) + "\n",
+            )
 
     def _append_name(self, record: NameRecord) -> None:
         """Append a single name record to the JSONL file."""

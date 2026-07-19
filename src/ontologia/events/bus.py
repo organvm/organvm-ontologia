@@ -221,6 +221,7 @@ def replay(
     subject_entity: str | None = None,
     limit: int = 500,
     path: Path | None = None,
+    on_error: Callable[[int, str, Exception], None] | None = None,
 ) -> list[OntologiaEvent]:
     """Read events from the JSONL log with optional filters.
 
@@ -239,13 +240,15 @@ def replay(
         return []
 
     events: list[OntologiaEvent] = []
-    for line in file_path.read_text().splitlines():
-        line = line.strip()
+    for line_number, raw_line in enumerate(file_path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
         if not line:
             continue
         try:
             data = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            if on_error is not None:
+                on_error(line_number, raw_line, error)
             continue
 
         if event_type and data.get("event_type") != event_type:
